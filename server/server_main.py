@@ -30,25 +30,25 @@ DEFAULT_PORT = 8888
 
 
 class ServerMain:
-    def __init__(self) -> None:
+    def __init__(self, root=None, parent=None) -> None:
         self.online_peers = {}
         self.peer_handlers = {}
-        # Lưu lịch sử toàn bộ peer đã từng kết nối (kể cả đã ngắt kết nối)
-        # key -> {"username", "ip", "port", "files", "connected_at", "disconnected_at"}
         self.peer_history = {}
         self.server_socket = None
         self.is_running = False
         self.thread_pool = ThreadPoolExecutor(max_workers=20)
         self.lock = threading.Lock()
 
-        self.root = tk.Tk()
-        self.root.title("P2P Central Directory & Indexing Server (Napster/Skype Model)")
-        self.root.geometry("900x600")
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root = root or tk.Tk()
+        self.parent = parent or self.root
+        if parent is None:
+            self.root.title("P2P Central Directory & Indexing Server")
+            self.root.geometry("900x600")
+            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.init_ui()
 
     def init_ui(self) -> None:
-        top_frame = ttk.LabelFrame(self.root, text="Cấu hình Máy chủ Trung tâm")
+        top_frame = ttk.LabelFrame(self.parent, text="Cấu hình Máy chủ Trung tâm")
         top_frame.pack(fill="x", padx=8, pady=8)
 
         ttk.Label(top_frame, text="Cổng Server:").pack(side="left", padx=(10, 5), pady=8)
@@ -74,7 +74,7 @@ class ServerMain:
         )
         clear_history_button.pack(side="right", padx=10)
 
-        main_paned = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
+        main_paned = ttk.PanedWindow(self.parent, orient=tk.VERTICAL)
         main_paned.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         peer_frame = ttk.LabelFrame(main_paned, text="Danh sách Peer (Online & Lịch sử ngắt kết nối)")
@@ -152,13 +152,10 @@ class ServerMain:
                 port = client_address[1]
                 self.log(f"Kết nối mới đến từ IP: {ip}:{port}")
                 handler = ClientHandler(client_socket, self)
-                self.peer_handlers_temp(handler)
+                self.thread_pool.submit(handler.run)
             except OSError as exc:
                 if self.is_running:
                     self.log(f"Lỗi chấp nhận kết nối: {exc}")
-
-    def peer_handlers_temp(self, handler: ClientHandler) -> None:
-        self.thread_pool.submit(handler.run)
 
     def register_peer(self, username: str, ip: str, p2p_port: int, handler) -> bool:
         key = username.lower()
@@ -168,7 +165,6 @@ class ServerMain:
             info = PeerInfo(username, ip, p2p_port)
             self.online_peers[key] = info
             self.peer_handlers[key] = handler
-            # Tạo/ghi đè bản ghi lịch sử cho lần kết nối này
             self.peer_history[key] = {
                 "username": username,
                 "ip": ip,
@@ -194,7 +190,6 @@ class ServerMain:
 
     def clear_disconnect_history(self) -> None:
         with self.lock:
-            # Chỉ xóa các bản ghi của peer hiện không còn online
             self.peer_history = {
                 key: entry
                 for key, entry in self.peer_history.items()
@@ -217,7 +212,10 @@ class ServerMain:
             if peer.get_username().lower() == requester_user.lower():
                 continue
             for file_descriptor in peer.get_shared_files():
-                filename = file_descriptor.get_file_name()
+                if hasattr(file_descriptor, "get_file_name"):
+                    filename = file_descriptor.get_file_name()
+                else:
+                    filename = str(file_descriptor)
                 if not q or q in filename.lower():
                     results.append(file_descriptor)
         return results
@@ -232,6 +230,18 @@ class ServerMain:
         if entries:
             response += "|" + "#".join(entries)
         return response
+
+    def peer_list_for_json(self):
+        with self.lock:
+            peers = list(self.online_peers.values())
+        return [
+            {
+                "name": peer.get_username(),
+                "host": peer.get_ip_address(),
+                "port": peer.get_p2p_port(),
+            }
+            for peer in peers
+        ]
 
     def broadcast_peer_list(self) -> None:
         message = self.build_peer_list_response()
@@ -253,7 +263,6 @@ class ServerMain:
             online_peers = dict(self.online_peers)
             history_entries = list(self.peer_history.values())
 
-        # Sắp xếp: peer đang online trước, sau đó theo thời gian kết nối gần nhất
         def sort_key(entry):
             is_online = entry["disconnected_at"] is None
             return (0 if is_online else 1, -entry["connected_at"].timestamp())
@@ -303,7 +312,6 @@ class ServerMain:
         self.server_socket = None
 
         with self.lock:
-            # Đánh dấu tất cả peer đang online là đã ngắt kết nối (do server dừng)
             now = datetime.now()
             for key in self.online_peers:
                 if key in self.peer_history:

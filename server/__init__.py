@@ -1,1 +1,1 @@
-"""Server-side modules for the P2P directory service."""
+"""Desktop P2P directory server package."""

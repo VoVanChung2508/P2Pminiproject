@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import socket
-from typing import List
+import threading
+import json
+from typing import TYPE_CHECKING
 
-from common.file_descriptor import FileDescriptor
 from common.message_protocol import (
     CMD_GET_ENDPOINT,
     CMD_GET_PEERS,
@@ -12,145 +13,129 @@ from common.message_protocol import (
     CMD_SEARCH_FILES,
     CMD_UPDATE_FILES,
     RES_ERROR,
-    RES_ENDPOINT,
     RES_PEER_LIST,
-    RES_REGISTER_ERR,
-    RES_REGISTER_OK,
     RES_SEARCH_RESULTS,
-    build_message,
 )
+
+if TYPE_CHECKING:
+    from server.server_main import ServerMain
 
 
 class ClientHandler:
-    def __init__(self, client_socket: socket.socket, server) -> None:
-        self.socket = client_socket
+    def __init__(self, client_socket: socket.socket, server: "ServerMain") -> None:
+        self.client_socket = client_socket
         self.server = server
-        self.peer_info = None
         self.running = True
-        self.username = None
+        self.lock = threading.Lock()
+
+    def send_response(self, message: str) -> None:
+        if self.client_socket:
+            try:
+                self.client_socket.sendall(message.encode("utf-8"))
+            except OSError:
+                self.running = False
 
     def run(self) -> None:
         try:
-            reader = self.socket.makefile("r", encoding="utf-8", newline="")
+            self.client_socket.settimeout(5)
             while self.running:
-                line = reader.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
+                try:
+                    data = self.client_socket.recv(4096)
+                except socket.timeout:
                     continue
-                self.handle_message(line)
-        except Exception as exc:
-            self.server.log(f"Kết nối bị ngắt đối với {self.username or 'Client'}: {exc}")
-        finally:
-            self.cleanup()
+                if not data:
+                    break
 
-    def handle_message(self, raw_message: str) -> None:
-        if raw_message is None or not raw_message.strip():
-            return
-        tokens = raw_message.split("|")
-        command = tokens[0]
+                message = data.decode("utf-8", errors="ignore").strip()
+                if not message:
+                    continue
 
-        if command == CMD_REGISTER:
-            self.handle_register(tokens)
-        elif command == CMD_UPDATE_FILES:
-            self.handle_update_files(tokens)
-        elif command == CMD_GET_PEERS:
-            self.handle_get_peers()
-        elif command == CMD_SEARCH_FILES:
-            self.handle_search_files(tokens)
-        elif command == CMD_GET_ENDPOINT:
-            self.handle_get_endpoint(tokens)
-        elif command == CMD_LOGOUT:
-            self.running = False
-        else:
-            self.send_response(build_message(RES_ERROR, f"Lệnh không hợp lệ: {command}"))
-
-    def handle_register(self, tokens) -> None:
-        if len(tokens) < 3:
-            self.send_response(build_message(RES_REGISTER_ERR, "Thiếu tham số đăng ký."))
-            return
-
-        username = tokens[1].strip()
-        try:
-            p2p_port = int(tokens[2].strip())
-        except ValueError:
-            self.send_response(build_message(RES_REGISTER_ERR, "Cổng P2P không hợp lệ."))
-            return
-
-        if not username:
-            self.send_response(build_message(RES_REGISTER_ERR, "Username không được để trống."))
-            return
-
-        client_ip = self.socket.getpeername()[0] if self.socket.getpeername() else "127.0.0.1"
-        success = self.server.register_peer(username, client_ip, p2p_port, self)
-        if success:
-            self.peer_info = self.server.get_peer(username)
-            self.username = username
-            self.send_response(build_message(RES_REGISTER_OK, f"Đăng ký thành công tài khoản: {username}"))
-            self.server.broadcast_peer_list()
-        else:
-            self.send_response(build_message(RES_REGISTER_ERR, f"Tên tài khoản '{username}' đã có người sử dụng."))
-
-    def handle_update_files(self, tokens) -> None:
-        if self.peer_info is None:
-            self.send_response(build_message(RES_ERROR, "Chưa đăng ký tài khoản."))
-            return
-
-        file_list = []
-        if len(tokens) >= 2 and tokens[1]:
-            for entry in tokens[1].split("#"):
-                file_descriptor = FileDescriptor.from_protocol_string(entry)
-                if file_descriptor is not None:
-                    file_descriptor.set_owner_username(self.peer_info.get_username())
-                    file_descriptor.set_owner_ip(self.peer_info.get_ip_address())
-                    file_descriptor.set_owner_p2p_port(self.peer_info.get_p2p_port())
-                    file_list.append(file_descriptor)
-
-        self.peer_info.update_shared_files(file_list)
-        self.server.log(f"Peer {self.peer_info.get_username()} đã cập nhật {len(file_list)} file chia sẻ.")
-
-    def handle_get_peers(self) -> None:
-        self.send_response(self.server.build_peer_list_response())
-
-    def handle_search_files(self, tokens) -> None:
-        query = tokens[1].strip().lower() if len(tokens) >= 2 else ""
-        results = self.server.search_files(query, self.peer_info.get_username() if self.peer_info else "")
-        payload = "#".join(item.to_protocol_string() for item in results)
-        self.send_response(build_message(RES_SEARCH_RESULTS, payload))
-
-    def handle_get_endpoint(self, tokens) -> None:
-        if len(tokens) < 2:
-            return
-        target_user = tokens[1].strip()
-        target_peer = self.server.get_peer(target_user)
-        if target_peer is not None:
-            self.send_response(
-                build_message(
-                    RES_ENDPOINT,
-                    target_peer.get_username(),
-                    target_peer.get_ip_address(),
-                    str(target_peer.get_p2p_port()),
-                )
-            )
-        else:
-            self.send_response(build_message(RES_ERROR, f"Peer '{target_user}' không tồn tại hoặc offline."))
-
-    def send_response(self, message: str) -> None:
-        if self.socket is None:
-            return
-        try:
-            self.socket.sendall((message + "\n").encode("utf-8"))
-        except Exception as exc:
-            self.server.log(f"Lỗi gửi response: {exc}")
-
-    def cleanup(self) -> None:
-        self.running = False
-        if self.peer_info is not None:
-            self.server.unregister_peer(self.peer_info.get_username())
-            self.server.broadcast_peer_list()
-        try:
-            if self.socket is not None and not self.socket._closed:
-                self.socket.close()
-        except Exception:
+                self.handle_message(message)
+        except OSError:
             pass
+        finally:
+            self.close()
+
+    def handle_message(self, message: str) -> None:
+        if message.startswith("{"):
+            self.handle_json_message(message)
+            return
+
+        parts = message.split("|")
+        if not parts:
+            return
+
+        command = parts[0]
+        if command == CMD_REGISTER:
+            if len(parts) < 4:
+                self.send_response(f"{RES_ERROR}|Invalid register payload")
+                return
+            username = parts[1]
+            ip = parts[2]
+            port = int(parts[3])
+            files = parts[4:] if len(parts) > 4 else []
+            if self.server.register_peer(username, ip, port, self):
+                self.send_response(f"{RES_PEER_LIST}|{self.server.build_peer_list_response().split('|', 1)[1] if '|' in self.server.build_peer_list_response() else ''}")
+            else:
+                self.send_response(f"{RES_ERROR}|Username already exists")
+
+        elif command == CMD_GET_PEERS:
+            self.send_response(self.server.build_peer_list_response())
+
+        elif command == CMD_SEARCH_FILES:
+            query = parts[1] if len(parts) > 1 else ""
+            requester = parts[2] if len(parts) > 2 else ""
+            result = self.server.search_files(query, requester)
+            payload = "#".join(
+                f"{fd.get_file_name()};{fd.get_ip_address()};{fd.get_p2p_port()}" for fd in result
+            )
+            self.send_response(f"{RES_SEARCH_RESULTS}|{payload}")
+
+        elif command == CMD_LOGOUT:
+            username = parts[1] if len(parts) > 1 else None
+            self.server.unregister_peer(username)
+            self.send_response(f"{RES_ERROR}|Logged out")
+            self.running = False
+
+        else:
+            self.send_response(f"{RES_ERROR}|Unsupported command: {command}")
+
+    def handle_json_message(self, message: str) -> None:
+        try:
+            request = json.loads(message)
+            action = request.get("action")
+            payload = request.get("payload", {})
+        except (json.JSONDecodeError, AttributeError):
+            self.send_response(json.dumps({"status": "error", "message": "Invalid JSON request"}))
+            return
+
+        if action == "REGISTER":
+            username = str(payload.get("name", "")).strip()
+            ip = str(payload.get("host", "")).strip()
+            port = int(payload.get("port", 0))
+            if not username or not ip or not port:
+                response = {"status": "error", "message": "Invalid register payload"}
+            elif self.server.register_peer(username, ip, port, self):
+                response = {"status": "ok", "peers": self.server.peer_list_for_json()}
+            else:
+                response = {"status": "error", "message": "Username already exists"}
+        elif action == "LIST_PEERS":
+            response = {"status": "ok", "peers": self.server.peer_list_for_json()}
+        elif action == "DISCONNECT":
+            username = str(payload.get("name", "")).strip()
+            self.server.unregister_peer(username)
+            response = {"status": "ok"}
+            self.running = False
+        elif action == "PING":
+            response = {"status": "ok", "message": "pong"}
+        else:
+            response = {"status": "error", "message": f"Unsupported action: {action}"}
+
+        self.send_response(json.dumps(response, ensure_ascii=False))
+
+    def close(self) -> None:
+        try:
+            self.client_socket.close()
+        except OSError:
+            pass
+        self.running = False
