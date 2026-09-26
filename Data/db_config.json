@@ -1,0 +1,9 @@
+{
+  "host": "127.0.0.1",
+  "port": 5432,
+  "dbname": "monitoring_db",
+  "user": "postgres",
+  "password": "postgres",
+  "pool_min": 2,
+  "pool_max": 10
+}

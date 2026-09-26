@@ -11,7 +11,7 @@ from flask import Flask, jsonify, render_template_string
 
 
 HTTP_HOST = "0.0.0.0"
-HTTP_PORT = int(environ.get("MONITOR_HTTP_PORT", "8080"))
+HTTP_PORT = int(environ.get("MONITOR_HTTP_PORT", "8081"))
 TCP_HOST = "0.0.0.0"
 TCP_PORT = int(environ.get("MONITOR_TCP_PORT", "8888"))
 HEARTBEAT_TIMEOUT = 15
@@ -182,15 +182,40 @@ def tcp_server() -> None:
             ).start()
 
 
+def is_port_available(port: int, host: str = "0.0.0.0") -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
+def find_available_port(preferred: int, host: str = "0.0.0.0", max_attempts: int = 50) -> int:
+    for p in range(preferred, preferred + max_attempts):
+        if is_port_available(p, host):
+            return p
+    return preferred
+
+
 def ensure_ports_available() -> None:
-    for port, service in ((TCP_PORT, "TCP"), (HTTP_PORT, "HTTP")):
+    global HTTP_PORT, TCP_PORT
+    for service, port_var_name in (("TCP", "TCP_PORT"), ("HTTP", "HTTP_PORT")):
+        port = globals()[port_var_name]
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             try:
                 probe.bind(("0.0.0.0", port))
             except OSError as exc:
+                env_key = f"MONITOR_{service}_PORT"
+                free_port = find_available_port(8081 if port == 8080 else port + 1)
+                if env_key not in environ:
+                    log(f"Port {port} for {service} is occupied ({exc}). Auto-switching to port {free_port}.")
+                    globals()[port_var_name] = free_port
+                    continue
                 raise SystemExit(
                     f"Cannot start {service} service on port {port}: {exc}. "
-                    "Set MONITOR_HTTP_PORT and MONITOR_TCP_PORT to free ports."
+                    f"Set {env_key} to a free port (e.g., {free_port})."
                 ) from exc
 
 
@@ -205,7 +230,12 @@ def dashboard():
 
 @app.route("/api/health")
 def api_health():
-    return jsonify({"status": "ok", "tcp_port": TCP_PORT, "http_port": HTTP_PORT})
+    return jsonify({
+        "status": "ok",
+        "project": "Network Monitoring System",
+        "tcp_port": TCP_PORT,
+        "http_port": HTTP_PORT,
+    })
 
 
 @app.route("/api/clients")
@@ -231,41 +261,157 @@ DASHBOARD_HTML = """
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Network Monitor</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Network Monitoring System</title>
 <style>
-body{margin:0;background:#08111f;color:#e5e7eb;font:15px Arial,sans-serif}
-.wrap{max-width:1100px;margin:28px auto;padding:0 18px}
-header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #26364d;padding-bottom:18px}
-h1{margin:0;color:#67e8f9;letter-spacing:2px}.meta{color:#94a3b8}
-.grid{display:grid;grid-template-columns:2fr 1fr;gap:18px;margin-top:20px}
-.panel{background:#101c2e;border:1px solid #26364d;border-radius:10px;padding:18px}
-h2{font-size:17px;margin:0 0 12px}table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:12px 8px;border-bottom:1px solid #26364d}
-th{color:#94a3b8;font-size:12px;text-transform:uppercase}
-.online{color:#4ade80}.offline{color:#f87171}.alert{border-left:3px solid #f59e0b;background:#211b11;padding:9px;margin:8px 0}
-.empty{color:#94a3b8}.bar{height:6px;background:#26364d;border-radius:4px}.fill{height:100%;background:#22d3ee;border-radius:4px}
-@media(max-width:800px){.grid{grid-template-columns:1fr}table{font-size:13px}th:nth-child(2),td:nth-child(2){display:none}}
+:root{--bg:#090d16;--card:#111927;--border:#1e293b;--primary:#38bdf8;--success:#22c55e;--danger:#ef4444;--warning:#f59e0b;--text:#f1f5f9;--subtext:#94a3b8}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 'Segoe UI',system-ui,-apple-system,sans-serif}
+.wrap{max-width:1200px;margin:24px auto;padding:0 20px}
+header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:18px;margin-bottom:20px}
+.title-group h1{margin:0;font-size:22px;letter-spacing:1px;color:var(--primary);font-weight:700}
+.title-group .sub{margin:4px 0 0;color:var(--subtext);font-size:13px}
+.meta-badges{display:flex;gap:10px}
+.badge{background:#1e293b;border:1px solid #334155;padding:5px 12px;border-radius:20px;font-size:12px;color:#cbd5e1}
+.stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:20px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;display:flex;flex-direction:column}
+.stat-card .label{font-size:12px;color:var(--subtext);text-transform:uppercase;font-weight:600}
+.stat-card .val{font-size:26px;font-weight:700;margin-top:6px;color:var(--primary)}
+.main-grid{display:grid;grid-template-columns:2.5fr 1fr;gap:20px}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px}
+.panel h2{font-size:16px;margin:0 0 14px;color:#e2e8f0;display:flex;align-items:center;justify-content:space-between}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:12px 10px;border-bottom:1px solid var(--border)}
+th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0.5px}
+.online-tag{color:var(--success);font-weight:600;display:inline-flex;align-items:center;gap:6px}
+.online-tag::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--success)}
+.offline-tag{color:var(--danger);font-weight:600;display:inline-flex;align-items:center;gap:6px}
+.offline-tag::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--danger)}
+.bar-wrap{display:flex;align-items:center;gap:8px}
+.bar{height:6px;background:#1e293b;border-radius:4px;flex:1;overflow:hidden}
+.fill{height:100%;background:var(--primary);border-radius:4px;transition:width 0.4s ease}
+.fill.warn{background:var(--warning)}
+.fill.high{background:var(--danger)}
+.alert-item{border-left:3px solid var(--warning);background:rgba(245,158,11,0.08);padding:10px 12px;border-radius:0 6px 6px 0;margin-bottom:8px;font-size:13px}
+.alert-time{font-size:11px;color:var(--subtext);margin-top:4px}
+.empty{color:var(--subtext);text-align:center;padding:24px 0}
+@media(max-width:900px){.main-grid{grid-template-columns:1fr}.stats-grid{grid-template-columns:1fr}}
 </style>
 </head>
-<body><main class="wrap"><header><h1>NETWORK MONITOR</h1>
-<div class="meta">TCP {{ tcp_port }} · heartbeat {{ heartbeat_timeout }}s</div></header>
-<div class="grid"><section class="panel"><h2>Clients</h2>
-<table><thead><tr><th>Client</th><th>IP</th><th>CPU</th><th>RAM</th><th>Disk</th><th>Status</th></tr></thead>
-<tbody id="clients"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody></table></section>
-<section class="panel"><h2>Alerts</h2><div id="alerts" class="empty">Loading...</div></section></div></main>
+<body>
+<div class="wrap">
+  <header>
+    <div class="title-group">
+      <h1>NETWORK MONITORING SYSTEM</h1>
+      <p class="sub">Hệ thống Giám sát Mạng & Thiết bị Phân tán theo thời gian thực</p>
+    </div>
+    <div class="meta-badges">
+      <span class="badge">TCP: {{ tcp_port }}</span>
+      <span class="badge">Heartbeat: {{ heartbeat_timeout }}s</span>
+      <span class="badge" id="last-sync">Sync: Đang tải...</span>
+    </div>
+  </header>
+
+  <div class="stats-grid">
+    <div class="stat-card"><span class="label">Tổng số Nodes</span><span class="val" id="stat-total">0</span></div>
+    <div class="stat-card"><span class="label">Nodes Đang Online</span><span class="val" style="color:var(--success)" id="stat-online">0</span></div>
+    <div class="stat-card"><span class="label">Cảnh báo Vượt ngưỡng</span><span class="val" style="color:var(--warning)" id="stat-alerts">0</span></div>
+  </div>
+
+  <div class="main-grid">
+    <section class="panel">
+      <h2><span>Danh sách Thiết bị / Nodes</span><span style="font-size:12px;color:var(--subtext);font-weight:normal" id="nodes-count"></span></h2>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Client</th>
+              <th>IP Address</th>
+              <th>CPU</th>
+              <th>RAM</th>
+              <th>Disk</th>
+              <th>Network</th>
+              <th>Trạng thái</th>
+            </tr>
+          </thead>
+          <tbody id="clients">
+            <tr><td colspan="7" class="empty">Đang kết nối tới máy chủ...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2><span>Nhật ký Cảnh báo (Alerts)</span></h2>
+      <div id="alerts"><div class="empty">Không có cảnh báo</div></div>
+    </section>
+  </div>
+</div>
+
 <script>
-function metric(value){return `${value}% <div class="bar"><div class="fill" style="width:${value}%"></div></div>`}
-async function refresh(){
- const clientsResponse=await fetch('/api/clients');
- const alertsResponse=await fetch('/api/alerts');
- const data=(await clientsResponse.json()).clients;
- document.querySelector('#clients').innerHTML=data.length?data.map(c=>`<tr><td><b>${c.name}</b></td><td>${c.ip}</td><td>${metric(c.cpu)}</td><td>${metric(c.ram)}</td><td>${metric(c.disk)}</td><td class="${c.status==='ONLINE'?'online':'offline'}">${c.status}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No clients registered</td></tr>';
- const items=(await alertsResponse.json()).alerts;
- document.querySelector('#alerts').innerHTML=items.length?items.slice(0,12).map(a=>`<div class="alert">${a.client}: ${a.metric} = ${a.value}%</div>`).join(''):'<div class="empty">No alerts</div>';
+function renderMetric(val) {
+  const num = parseFloat(val) || 0;
+  const cls = num > 90 ? 'high' : (num > 75 ? 'warn' : '');
+  return `<div class="bar-wrap"><span>${num}%</span><div class="bar"><div class="fill ${cls}" style="width:${Math.min(100, num)}%"></div></div></div>`;
 }
-refresh();setInterval(refresh,3000);
-</script></body></html>
+
+async function refresh() {
+  try {
+    const [clientsRes, alertsRes] = await Promise.all([
+      fetch('/api/clients'),
+      fetch('/api/alerts')
+    ]);
+    const clientsData = (await clientsRes.json()).clients || [];
+    const alertsData = (await alertsRes.json()).alerts || [];
+
+    const onlineCount = clientsData.filter(c => c.status === 'ONLINE').length;
+    document.getElementById('stat-total').textContent = clientsData.length;
+    document.getElementById('stat-online').textContent = onlineCount;
+    document.getElementById('stat-alerts').textContent = alertsData.length;
+    document.getElementById('nodes-count').textContent = `${onlineCount}/${clientsData.length} online`;
+
+    const clientsTbody = document.getElementById('clients');
+    if (clientsData.length === 0) {
+      clientsTbody.innerHTML = '<tr><td colspan="7" class="empty">Chưa có thiết bị nào đăng ký</td></tr>';
+    } else {
+      clientsTbody.innerHTML = clientsData.map(c => `
+        <tr>
+          <td><strong>${c.name}</strong></td>
+          <td><code>${c.ip}</code></td>
+          <td style="min-width:110px">${renderMetric(c.cpu)}</td>
+          <td style="min-width:110px">${renderMetric(c.ram)}</td>
+          <td style="min-width:110px">${renderMetric(c.disk)}</td>
+          <td style="min-width:110px">${renderMetric(c.network)}</td>
+          <td><span class="${c.status === 'ONLINE' ? 'online-tag' : 'offline-tag'}">${c.status}</span></td>
+        </tr>
+      `).join('');
+    }
+
+    const alertsBox = document.getElementById('alerts');
+    if (alertsData.length === 0) {
+      alertsBox.innerHTML = '<div class="empty">Hệ thống bình thường, không có cảnh báo</div>';
+    } else {
+      alertsBox.innerHTML = alertsData.slice(0, 10).map(a => `
+        <div class="alert-item">
+          <div><strong>${a.client}</strong>: Chỉ số ${a.metric} vượt ngưỡng (<b>${a.value}%</b> &gt; ${a.limit}%)</div>
+          <div class="alert-time">${a.timestamp}</div>
+        </div>
+      `).join('');
+    }
+
+    const now = new Date();
+    document.getElementById('last-sync').textContent = 'Sync: ' + now.toLocaleTimeString();
+  } catch (err) {
+    document.getElementById('last-sync').textContent = 'Mất kết nối API';
+  }
+}
+
+refresh();
+setInterval(refresh, 2500);
+</script>
+</body>
+</html>
 """
 
 

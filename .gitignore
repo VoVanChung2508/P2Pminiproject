@@ -1,37 +1,150 @@
-# Python bytecode
-__pycache__/
+# ==============================
+
+# Python
+
+# ==============================
+
+**pycache**/
 *.py[cod]
 *$py.class
+*.pyo
 
-# Virtual environments
+# Python cache
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==============================
+
+# Virtual Environment
+
+# ==============================
+
 .venv/
 venv/
 env/
+ENV/
 
-# IDE/editor folders
+# ==============================
+
+# Environment / Secrets
+
+# ==============================
+
+.env
+.env.*
+!.env.example
+
+# ==============================
+
+# IDE - PyCharm
+
+# ==============================
+
 .idea/
+*.iml
+
+# ==============================
+
+# VS Code
+
+# ==============================
+
 .vscode/
+
+# ==============================
+
+# Jupyter
+
+# ==============================
+
+.ipynb_checkpoints/
+
+# ==============================
+
+# Database
+
+# ==============================
+
+*.db
+*.sqlite
+*.sqlite3
+
+# ==============================
+
+# Logs
+
+# ==============================
+
+*.log
+logs/
+
+# ==============================
+
+# Temporary files
+
+# ==============================
+
+*.tmp
+*.temp
 *.swp
 *.swo
+*~
+
+# ==============================
 
 # OS files
-.DS_Store
+
+# ==============================
+
+# Windows
+
 Thumbs.db
+Desktop.ini
 
-# Logs and temp
-*.log
-*.tmp
+# macOS
 
-# Python packaging
+.DS_Store
+
+# ==============================
+
+# Build / Distribution
+
+# ==============================
+
 build/
 dist/
 *.egg-info/
 
-# Test / coverage
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
+# ==============================
 
-# Jupyter
-.ipynb_checkpoints/
+# Project-specific
+
+# ==============================
+
+# Downloaded/generated files
+
+downloads/
+uploads/
+
+# Monitoring temporary data
+
+monitoring_data/
+*.pid
+
+# ==============================
+
+# Keep important project files
+
+# ==============================
+
+# requirements.txt
+
+# README.md
+
+# Data/db.py
+
+# Data/db_config.json
