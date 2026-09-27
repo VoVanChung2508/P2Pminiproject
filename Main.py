@@ -268,7 +268,7 @@ DASHBOARD_HTML = """
 :root{--bg:#090d16;--card:#111927;--border:#1e293b;--primary:#38bdf8;--success:#22c55e;--danger:#ef4444;--warning:#f59e0b;--text:#f1f5f9;--subtext:#94a3b8}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 'Segoe UI',system-ui,-apple-system,sans-serif}
-.wrap{max-width:1200px;margin:24px auto;padding:0 20px}
+.wrap{max-width:1300px;margin:24px auto;padding:0 20px}
 header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:18px;margin-bottom:20px}
 .title-group h1{margin:0;font-size:22px;letter-spacing:1px;color:var(--primary);font-weight:700}
 .title-group .sub{margin:4px 0 0;color:var(--subtext);font-size:13px}
@@ -278,12 +278,21 @@ header{display:flex;justify-content:space-between;align-items:center;border-bott
 .stat-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;display:flex;flex-direction:column}
 .stat-card .label{font-size:12px;color:var(--subtext);text-transform:uppercase;font-weight:600}
 .stat-card .val{font-size:26px;font-weight:700;margin-top:6px;color:var(--primary)}
+.chart-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:20px 0}
+.chart-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px}
+.chart-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.chart-head h3{margin:0;font-size:16px}
+.chart-value{display:inline-block;padding:5px 10px;border-radius:999px;background:rgba(56,189,248,.10);color:#bae6fd;border:1px solid rgba(56,189,248,.35);font-weight:700}
+.chart-card canvas{display:block;width:100%;height:180px;border-radius:8px;border:1px solid #1f2937;background:linear-gradient(180deg,#0f172a,#020817)}
 .main-grid{display:grid;grid-template-columns:2.5fr 1fr;gap:20px}
 .panel{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px}
 .panel h2{font-size:16px;margin:0 0 14px;color:#e2e8f0;display:flex;align-items:center;justify-content:space-between}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:12px 10px;border-bottom:1px solid var(--border)}
 th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0.5px}
+.client-row{cursor:pointer;transition:background .2s ease}
+.client-row:hover{background:rgba(56,189,248,.05)}
+.client-row.selected{background:rgba(56,189,248,.12)}
 .online-tag{color:var(--success);font-weight:600;display:inline-flex;align-items:center;gap:6px}
 .online-tag::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--success)}
 .offline-tag{color:var(--danger);font-weight:600;display:inline-flex;align-items:center;gap:6px}
@@ -296,7 +305,7 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
 .alert-item{border-left:3px solid var(--warning);background:rgba(245,158,11,0.08);padding:10px 12px;border-radius:0 6px 6px 0;margin-bottom:8px;font-size:13px}
 .alert-time{font-size:11px;color:var(--subtext);margin-top:4px}
 .empty{color:var(--subtext);text-align:center;padding:24px 0}
-@media(max-width:900px){.main-grid{grid-template-columns:1fr}.stats-grid{grid-template-columns:1fr}}
+@media(max-width:900px){.main-grid{grid-template-columns:1fr}.stats-grid{grid-template-columns:1fr}.chart-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -317,6 +326,21 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
     <div class="stat-card"><span class="label">Tổng số Nodes</span><span class="val" id="stat-total">0</span></div>
     <div class="stat-card"><span class="label">Nodes Đang Online</span><span class="val" style="color:var(--success)" id="stat-online">0</span></div>
     <div class="stat-card"><span class="label">Cảnh báo Vượt ngưỡng</span><span class="val" style="color:var(--warning)" id="stat-alerts">0</span></div>
+  </div>
+
+  <div class="chart-grid">
+    <div class="chart-card">
+      <div class="chart-head"><h3>CPU</h3><span class="chart-value" id="cpu-value">0%</span></div>
+      <canvas id="cpu-chart" width="320" height="180"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head"><h3>RAM</h3><span class="chart-value" id="ram-value">0%</span></div>
+      <canvas id="ram-chart" width="320" height="180"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head"><h3>Network Traffic</h3><span class="chart-value" id="network-value">0%</span></div>
+      <canvas id="network-chart" width="320" height="180"></canvas>
+    </div>
   </div>
 
   <div class="main-grid">
@@ -350,10 +374,116 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
 </div>
 
 <script>
+const chartSettings = {
+  cpu: { color: '#38bdf8', valueEl: 'cpu-value', canvasId: 'cpu-chart' },
+  ram: { color: '#22c55e', valueEl: 'ram-value', canvasId: 'ram-chart' },
+  network: { color: '#a78bfa', valueEl: 'network-value', canvasId: 'network-chart' }
+};
+let selectedClientName = null;
+
 function renderMetric(val) {
   const num = parseFloat(val) || 0;
   const cls = num > 90 ? 'high' : (num > 75 ? 'warn' : '');
   return `<div class="bar-wrap"><span>${num}%</span><div class="bar"><div class="fill ${cls}" style="width:${Math.min(100, num)}%"></div></div></div>`;
+}
+
+function normalizeHistory(samples = []) {
+  return samples.slice(-30).map((sample) => ({
+    cpu: Number(sample.cpu || 0),
+    ram: Number(sample.ram || 0),
+    network: Number(sample.network || 0),
+    timestamp: sample.timestamp || Date.now()
+  }));
+}
+
+function drawChart(canvasId, values, color) {
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext('2d');
+  const width = canvas.width = Math.max(canvas.clientWidth * 2, 320);
+  const height = canvas.height = 180 * 2;
+  const pad = 18;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#020817';
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.strokeStyle = 'rgba(148,163,184,0.18)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad + ((height - pad * 2) / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(pad, y);
+    ctx.lineTo(width - pad, y);
+    ctx.stroke();
+  }
+
+  if (!values || values.length === 0) {
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '14px Segoe UI';
+    ctx.fillText('Chưa có dữ liệu', pad + 8, height / 2);
+    return;
+  }
+
+  const data = values.map(v => Number(v) || 0);
+  const maxVal = Math.max(100, ...data, 10);
+  const stepX = (width - pad * 2) / Math.max(data.length - 1, 1);
+
+  ctx.beginPath();
+  data.forEach((value, index) => {
+    const x = pad + index * stepX;
+    const y = height - pad - ((value / maxVal) * (height - pad * 2));
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.5;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 10;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+}
+
+function renderCharts(historySamples) {
+  const history = normalizeHistory(historySamples);
+  const cpuValues = history.map(item => item.cpu);
+  const ramValues = history.map(item => item.ram);
+  const networkValues = history.map(item => item.network);
+
+  const cpuCurrent = cpuValues.length ? cpuValues[cpuValues.length - 1] : 0;
+  const ramCurrent = ramValues.length ? ramValues[ramValues.length - 1] : 0;
+  const networkCurrent = networkValues.length ? networkValues[networkValues.length - 1] : 0;
+
+  document.getElementById('cpu-value').textContent = `${cpuCurrent.toFixed(0)}%`;
+  document.getElementById('ram-value').textContent = `${ramCurrent.toFixed(0)}%`;
+  document.getElementById('network-value').textContent = `${networkCurrent.toFixed(0)}%`;
+
+  drawChart('cpu-chart', cpuValues, '#38bdf8');
+  drawChart('ram-chart', ramValues, '#22c55e');
+  drawChart('network-chart', networkValues, '#a78bfa');
+}
+
+async function fetchClientHistory(clientName) {
+  if (!clientName) return [];
+  try {
+    const res = await fetch(`/api/clients/${encodeURIComponent(clientName)}/history`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.samples || [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function updateSelection(clients) {
+  if (!clients || clients.length === 0) {
+    selectedClientName = null;
+    return;
+  }
+
+  const available = clients.map(c => c.name);
+  if (!selectedClientName || !available.includes(selectedClientName)) {
+    const preferredOnline = clients.find(c => c.status === 'ONLINE');
+    selectedClientName = preferredOnline ? preferredOnline.name : clients[0].name;
+  }
 }
 
 async function refresh() {
@@ -365,6 +495,8 @@ async function refresh() {
     const clientsData = (await clientsRes.json()).clients || [];
     const alertsData = (await alertsRes.json()).alerts || [];
 
+    updateSelection(clientsData);
+
     const onlineCount = clientsData.filter(c => c.status === 'ONLINE').length;
     document.getElementById('stat-total').textContent = clientsData.length;
     document.getElementById('stat-online').textContent = onlineCount;
@@ -374,9 +506,10 @@ async function refresh() {
     const clientsTbody = document.getElementById('clients');
     if (clientsData.length === 0) {
       clientsTbody.innerHTML = '<tr><td colspan="7" class="empty">Chưa có thiết bị nào đăng ký</td></tr>';
+      renderCharts([]);
     } else {
       clientsTbody.innerHTML = clientsData.map(c => `
-        <tr>
+        <tr class="client-row ${selectedClientName === c.name ? 'selected' : ''}" data-client-name="${c.name}" onclick="selectClient('${c.name.replace(/'/g, "\\'")}')">
           <td><strong>${c.name}</strong></td>
           <td><code>${c.ip}</code></td>
           <td style="min-width:110px">${renderMetric(c.cpu)}</td>
@@ -386,6 +519,9 @@ async function refresh() {
           <td><span class="${c.status === 'ONLINE' ? 'online-tag' : 'offline-tag'}">${c.status}</span></td>
         </tr>
       `).join('');
+
+      const selectedHistory = await fetchClientHistory(selectedClientName);
+      renderCharts(selectedHistory);
     }
 
     const alertsBox = document.getElementById('alerts');
@@ -405,6 +541,11 @@ async function refresh() {
   } catch (err) {
     document.getElementById('last-sync').textContent = 'Mất kết nối API';
   }
+}
+
+function selectClient(clientName) {
+  selectedClientName = clientName;
+  refresh();
 }
 
 refresh();
