@@ -24,12 +24,17 @@ TCP_CLIENT_TIMEOUT = 30
 SAMPLE_LIMIT = 120
 ADMIN_TOKEN = environ.get("MONITOR_ADMIN_TOKEN", "")
 PROCESS_LIST_CAPABILITY = "PROCESS_LIST_V1"
+CONTROLLED_COMMANDS_CAPABILITY = "CONTROLLED_COMMANDS_V1"
+CONTROLLED_COMMANDS = frozenset(
+    {"PING", "GET_INFO", "GET_PROCESS_LIST", "GET_NETWORK_INFO"}
+)
 PROCESS_LIST_TOP_N = 20
 PROCESS_LIST_REQUEST_TIMEOUT_SECONDS = 30
 PROCESS_LIST_MAX_PAYLOAD_BYTES = 65536
 PROCESS_LIST_MAX_TCP_FRAME_BYTES = PROCESS_LIST_MAX_PAYLOAD_BYTES + 512
 PROCESS_LIST_MAX_TRACKED_CLIENTS = 1000
 PROCESS_LIST_RESULT_RETENTION_SECONDS = 300
+CONTROLLED_COMMAND_REQUEST_TIMEOUT_SECONDS = 15
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
@@ -37,6 +42,7 @@ state_lock = threading.RLock()
 clients: dict[str, dict[str, Any]] = {}
 disconnected_clients: set[str] = set()
 process_requests: dict[str, dict[str, Any]] = {}
+controlled_command_requests: dict[str, dict[str, Any]] = {}
 
 db_manager = DatabaseManager()
 
@@ -85,18 +91,21 @@ def register_client(
     name: str,
     ip: str,
     process_list_capable: bool = False,
+    controlled_commands_capable: bool = False,
 ) -> None:
     key = name.lower()
     if not db_manager.register_client(name, ip):
         raise RuntimeError("MySQL did not save the client registration.")
     with state_lock:
         disconnected_clients.discard(key)
+        controlled_command_requests.pop(key, None)
         clients[key] = {
             "name": name,
             "ip": ip,
             "status": "ONLINE",
             "last_seen_epoch": time.time(),
             "process_list_capable": process_list_capable,
+            "controlled_commands_capable": controlled_commands_capable,
         }
     log(f"{name} registered from {ip}")
 
@@ -176,6 +185,249 @@ def _prune_process_requests_locked(now: float) -> None:
             del process_requests[client_key]
 
 
+def _expire_controlled_command_locked(client_key: str) -> None:
+    command_request = controlled_command_requests.get(client_key)
+    if (
+        command_request
+        and command_request["status"] in {"pending", "delivered"}
+        and time.monotonic() >= command_request["expires_at"]
+    ):
+        command_request["status"] = "timeout"
+        command_request["result"] = None
+        command_request["completed_at"] = time.time()
+
+
+def _prune_controlled_commands_locked(now: float) -> None:
+    for client_key, command_request in tuple(controlled_command_requests.items()):
+        if (
+            command_request["status"] in {"pending", "delivered"}
+            and now >= command_request["expires_at"]
+        ):
+            command_request["status"] = "timeout"
+            command_request["result"] = None
+            command_request["completed_at"] = time.time()
+        elif (
+            command_request["status"] not in {"pending", "delivered"}
+            and now
+            >= command_request["expires_at"] + PROCESS_LIST_RESULT_RETENTION_SECONDS
+        ):
+            del controlled_command_requests[client_key]
+
+
+def _queue_controlled_command(
+    name: str,
+    command: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if command not in CONTROLLED_COMMANDS:
+        return None, "Unsupported command."
+
+    key = name.lower()
+    with state_lock:
+        now = time.monotonic()
+        _prune_controlled_commands_locked(now)
+        client = clients.get(key)
+        if (
+            client is None
+            or client["status"] != "ONLINE"
+            or key in disconnected_clients
+        ):
+            return None, "Client is not registered or is offline."
+        if not client.get("controlled_commands_capable", False):
+            return None, "Client does not support controlled commands."
+        _expire_controlled_command_locked(key)
+        existing = controlled_command_requests.get(key)
+        if existing and existing["status"] in {"pending", "delivered"}:
+            return None, "A controlled command is already pending."
+        existing_process_request = process_requests.get(key)
+        if existing_process_request and existing_process_request["status"] in {
+            "pending",
+            "delivered",
+        }:
+            return None, "A process-list request is already pending."
+        if (
+            key not in controlled_command_requests
+            and len(controlled_command_requests) >= PROCESS_LIST_MAX_TRACKED_CLIENTS
+        ):
+            return None, "Controlled command capacity is full."
+
+        command_request = {
+            "client": client["name"],
+            "request_id": uuid.uuid4().hex,
+            "command": command,
+            "status": "pending",
+            "requested_at": time.time(),
+            "expires_at": now + CONTROLLED_COMMAND_REQUEST_TIMEOUT_SECONDS,
+            "result": None,
+        }
+        controlled_command_requests[key] = command_request
+        return dict(command_request), None
+
+
+def _next_controlled_command(
+    name: str,
+    address: tuple[str, int],
+) -> str | None:
+    key = name.lower()
+    with state_lock:
+        client = clients.get(key)
+        command_request = controlled_command_requests.get(key)
+        if (
+            client is None
+            or not client.get("controlled_commands_capable", False)
+            or command_request is None
+            or command_request["status"] != "pending"
+        ):
+            return None
+        _expire_controlled_command_locked(key)
+        if command_request["status"] != "pending":
+            return None
+        command_request["status"] = "delivered"
+        command_request["delivery_address"] = address
+        command = command_request["command"]
+        if command == "GET_PROCESS_LIST":
+            return (
+                f"COMMAND|{command_request['request_id']}|{command}|"
+                f"{PROCESS_LIST_TOP_N}"
+            )
+        return f"COMMAND|{command_request['request_id']}|{command}"
+
+
+def _validate_controlled_command_result(
+    command: str,
+    payload: str,
+) -> Any:
+    if len(payload.encode("utf-8")) > PROCESS_LIST_MAX_PAYLOAD_BYTES:
+        raise ValueError("Command response exceeds the maximum size.")
+    if command == "PING":
+        if payload != "PONG":
+            raise ValueError("PING response must be PONG.")
+        return payload
+
+    result = json.loads(payload)
+    if command == "GET_PROCESS_LIST":
+        return _validate_process_list(result, PROCESS_LIST_TOP_N)
+    if command == "GET_INFO":
+        fields = {
+            "client_name",
+            "hostname",
+            "os",
+            "os_release",
+            "machine",
+            "python_version",
+        }
+        if (
+            not isinstance(result, dict)
+            or set(result) != fields
+            or any(
+                not isinstance(result[field], str)
+                or not result[field]
+                or len(result[field]) > 256
+                for field in fields
+            )
+        ):
+            raise ValueError("Client information response is invalid.")
+        return dict(result)
+    if command == "GET_NETWORK_INFO":
+        fields = {
+            "bytes_sent",
+            "bytes_recv",
+            "packets_sent",
+            "packets_recv",
+            "upload_bytes_per_sec",
+            "download_bytes_per_sec",
+        }
+        if not isinstance(result, dict) or set(result) != fields:
+            raise ValueError("Network information response fields are invalid.")
+        for field in ("bytes_sent", "bytes_recv", "packets_sent", "packets_recv"):
+            value = result[field]
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"Network counter {field} is invalid.")
+        for field in ("upload_bytes_per_sec", "download_bytes_per_sec"):
+            value = result[field]
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value < 0
+            ):
+                raise ValueError(f"Network rate {field} is invalid.")
+        return dict(result)
+    raise ValueError("Unsupported controlled command.")
+
+
+def _accept_controlled_command_response(
+    request_id: str,
+    payload: str,
+    address: tuple[str, int],
+    *,
+    error_code: str | None = None,
+) -> str:
+    if not request_id.isalnum() or len(request_id) > 64:
+        return "ERROR|MALFORMED_COMMAND_RESPONSE"
+    key = None
+    with state_lock:
+        for candidate, command_request in controlled_command_requests.items():
+            if command_request["request_id"] == request_id:
+                key = candidate
+                break
+        if key is None:
+            return "ERROR|INVALID_COMMAND_REQUEST"
+        command_request = controlled_command_requests[key]
+        if (
+            key not in clients
+            or clients[key]["status"] != "ONLINE"
+            or key in disconnected_clients
+            or not clients[key].get("controlled_commands_capable", False)
+            or command_request["status"] != "delivered"
+            or command_request.get("delivery_address") != address
+        ):
+            return "ERROR|INVALID_COMMAND_REQUEST"
+        _expire_controlled_command_locked(key)
+        if command_request["status"] != "delivered":
+            return "ERROR|COMMAND_TIMEOUT"
+        command = command_request["command"]
+
+    if error_code is not None:
+        if error_code not in {"UNAVAILABLE", "FAILED", "UNSUPPORTED"}:
+            return "ERROR|MALFORMED_COMMAND_RESPONSE"
+        result = None
+        status = "error"
+    else:
+        try:
+            result = _validate_controlled_command_result(command, payload)
+        except (json.JSONDecodeError, RecursionError, ValueError, OverflowError) as error:
+            logger.warning(
+                "Rejected malformed %s response from client %s (%s).",
+                command,
+                command_request["client"],
+                type(error).__name__,
+            )
+            return "ERROR|MALFORMED_COMMAND_RESPONSE"
+        status = "complete"
+
+    with state_lock:
+        current = controlled_command_requests.get(key)
+        if (
+            current is None
+            or current["request_id"] != request_id
+            or current["status"] != "delivered"
+            or current.get("delivery_address") != address
+        ):
+            return "ERROR|INVALID_COMMAND_REQUEST"
+        current["status"] = status
+        current["result"] = result
+        current["completed_at"] = time.time()
+    logger.info(
+        "Controlled command %s for client %s completed with status %s.",
+        command,
+        command_request["client"],
+        status,
+    )
+    return "OK|COMMAND"
+
+
 def _queue_process_request(name: str) -> tuple[dict[str, Any] | None, str | None]:
     key = name.lower()
     with state_lock:
@@ -194,6 +446,12 @@ def _queue_process_request(name: str) -> tuple[dict[str, Any] | None, str | None
         existing = process_requests.get(key)
         if existing and existing["status"] in {"pending", "delivered"}:
             return None, "A process-list request is already pending."
+        existing_command_request = controlled_command_requests.get(key)
+        if existing_command_request and existing_command_request["status"] in {
+            "pending",
+            "delivered",
+        }:
+            return None, "A controlled command is already pending."
         if key not in process_requests and len(process_requests) >= PROCESS_LIST_MAX_TRACKED_CLIENTS:
             return None, "Process-list request capacity is full."
 
@@ -401,6 +659,22 @@ def mark_offline_clients() -> None:
 def handle_message(message: str, address: tuple[str, int]) -> str:
     process_parts = message.strip().split("|", 3)
     process_command = process_parts[0].upper()
+    if process_command in {"RESPONSE", "COMMAND_ERROR"}:
+        response_parts = message.strip().split("|", 2)
+        if len(response_parts) != 3:
+            return "ERROR|MALFORMED_COMMAND_RESPONSE"
+        if process_command == "RESPONSE":
+            return _accept_controlled_command_response(
+                response_parts[1],
+                response_parts[2],
+                address,
+            )
+        return _accept_controlled_command_response(
+            response_parts[1],
+            "",
+            address,
+            error_code=response_parts[2],
+        )
     if process_command == "PROCESS_LIST":
         if len(process_parts) != 4:
             return "ERROR|MALFORMED_PROCESS_LIST"
@@ -455,6 +729,7 @@ def handle_message(message: str, address: tuple[str, int]) -> str:
                 parts[1],
                 address[0],
                 PROCESS_LIST_CAPABILITY in parts[2:],
+                CONTROLLED_COMMANDS_CAPABILITY in parts[2:],
             )
             return "OK|REGISTERED"
         if len(parts) >= 2 and is_client_disconnected(parts[1]):
@@ -463,6 +738,9 @@ def handle_message(message: str, address: tuple[str, int]) -> str:
             if not touch_client(parts[1]):
                 reason = "DISCONNECTED" if is_client_disconnected(parts[1]) else "NOT_REGISTERED"
                 return f"ERROR|{reason}"
+            controlled_command = _next_controlled_command(parts[1], address)
+            if controlled_command is not None:
+                return controlled_command
             process_command = _next_process_command(parts[1], address)
             if process_command is not None:
                 return process_command
@@ -796,6 +1074,93 @@ def api_process_list(name: str):
                 {"status": "error", "message": "No process-list request found."}
             ), 404
         result = dict(process_request)
+        result.pop("expires_at", None)
+    return jsonify({"status": "ok", "request": result})
+
+
+@app.route("/api/clients/<name>/commands", methods=["GET", "POST"])
+def api_controlled_commands(name: str):
+    auth_error = _admin_token_error()
+    if auth_error is not None:
+        message, status_code = auth_error
+        return jsonify({"status": "error", "message": message}), status_code
+
+    key = name.lower()
+    if request.method == "POST":
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or set(body) != {"command"}:
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": 'Request body must be {"command": "<allowed command>"}',
+                    "code": "MALFORMED_COMMAND",
+                }
+            ), 400
+        command = body["command"]
+        if not isinstance(command, str) or command not in CONTROLLED_COMMANDS:
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": "Command is not in the supported allowlist.",
+                    "code": "UNSUPPORTED_COMMAND",
+                }
+            ), 400
+
+        command_request, error = _queue_controlled_command(name, command)
+        if error is not None:
+            with state_lock:
+                client = clients.get(key)
+                if client is None:
+                    error_code = "CLIENT_NOT_FOUND"
+                elif client["status"] != "ONLINE" or key in disconnected_clients:
+                    error_code = "CLIENT_OFFLINE"
+                elif not client.get("controlled_commands_capable", False):
+                    error_code = "COMMANDS_UNSUPPORTED"
+                elif (
+                    client.get("process_list_capable", False)
+                    and not client.get("controlled_commands_capable", False)
+                ):
+                    error_code = "COMMANDS_UNSUPPORTED"
+                elif (
+                    (process_requests.get(key) or {}).get("status")
+                    in {"pending", "delivered"}
+                    or (controlled_command_requests.get(key) or {}).get("status")
+                    in {"pending", "delivered"}
+                ):
+                    error_code = "COMMAND_PENDING"
+                else:
+                    error_code = "COMMAND_CAPACITY"
+            status_code = (
+                404
+                if error_code == "CLIENT_NOT_FOUND"
+                else 503
+                if error_code == "COMMAND_CAPACITY"
+                else 409
+            )
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": error,
+                    "code": error_code,
+                }
+            ), status_code
+        logger.info(
+            "Queued controlled command %s for registered client %s.",
+            command,
+            name,
+        )
+        command_request.pop("expires_at", None)
+        return jsonify({"status": "ok", "request": command_request}), 202
+
+    with state_lock:
+        _expire_controlled_command_locked(key)
+        _prune_controlled_commands_locked(time.monotonic())
+        command_request = controlled_command_requests.get(key)
+        if command_request is None:
+            return jsonify(
+                {"status": "error", "message": "No controlled command request found."}
+            ), 404
+        result = dict(command_request)
         result.pop("expires_at", None)
     return jsonify({"status": "ok", "request": result})
 

@@ -7,11 +7,13 @@ import os
 import socket
 import threading
 import tempfile
+import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 from client import monitoring_client, process_monitor, tcp_client
@@ -545,10 +547,14 @@ class ProcessMonitoringTests(unittest.TestCase):
         self.previous_clients = copy.deepcopy(server.clients)
         self.previous_disconnected = set(server.disconnected_clients)
         self.previous_process_requests = copy.deepcopy(server.process_requests)
+        self.previous_controlled_requests = copy.deepcopy(
+            server.controlled_command_requests
+        )
         server.ADMIN_TOKEN = "test-process-admin-token"
         server.clients.clear()
         server.disconnected_clients.clear()
         server.process_requests.clear()
+        server.controlled_command_requests.clear()
 
         self.database_patches = (
             patch.object(server.db_manager, "register_client", return_value=True),
@@ -568,6 +574,8 @@ class ProcessMonitoringTests(unittest.TestCase):
         server.disconnected_clients.update(self.previous_disconnected)
         server.process_requests.clear()
         server.process_requests.update(self.previous_process_requests)
+        server.controlled_command_requests.clear()
+        server.controlled_command_requests.update(self.previous_controlled_requests)
 
     def register(self, name: str, *, capable: bool = True) -> None:
         capability = f"|{server.PROCESS_LIST_CAPABILITY}" if capable else ""
@@ -761,7 +769,7 @@ class ProcessMonitoringTests(unittest.TestCase):
                 ).heartbeat()
 
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["raw"], "OK|HEARTBEAT")
+        self.assertEqual(result["raw"], "OK|PROCESS_LIST")
         self.assertEqual(result["process_list_status"], "complete")
         collect.assert_called_once_with(20)
         sent_lines = [
@@ -784,13 +792,14 @@ class ProcessMonitoringTests(unittest.TestCase):
 
         self.assertEqual(
             message,
-            "REGISTER|process-node|127.0.0.1|8888|PROCESS_LIST_V1",
+            "REGISTER|process-node|127.0.0.1|8888|PROCESS_LIST_V1|CONTROLLED_COMMANDS_V1",
         )
         self.assertEqual(
             server.handle_message(message, ("127.0.0.1", 30000)),
             "OK|REGISTERED",
         )
         self.assertTrue(server.clients["process-node"]["process_list_capable"])
+        self.assertTrue(server.clients["process-node"]["controlled_commands_capable"])
 
     def test_raw_socket_registration_fallback_advertises_capability(self) -> None:
         fake_socket = Mock()
@@ -963,6 +972,391 @@ class ProcessMonitoringTests(unittest.TestCase):
         )
 
         self.assertEqual(response, "ERROR|Unsupported message")
+
+
+class ControlledCommandTests(unittest.TestCase):
+    SAMPLE_PROCESS = {
+        "pid": 123,
+        "name": "worker",
+        "username": None,
+        "cpu_percent": 12.5,
+        "memory_percent": 3.25,
+        "status": "running",
+    }
+    NETWORK_INFO = {
+        "bytes_sent": 1024,
+        "bytes_recv": 2048,
+        "packets_sent": 10,
+        "packets_recv": 20,
+        "upload_bytes_per_sec": 15.5,
+        "download_bytes_per_sec": 26.5,
+    }
+
+    def setUp(self) -> None:
+        self.previous_admin_token = server.ADMIN_TOKEN
+        self.previous_clients = copy.deepcopy(server.clients)
+        self.previous_disconnected = set(server.disconnected_clients)
+        self.previous_process_requests = copy.deepcopy(server.process_requests)
+        self.previous_controlled_requests = copy.deepcopy(
+            server.controlled_command_requests
+        )
+        server.ADMIN_TOKEN = "test-command-admin-token"
+        server.clients.clear()
+        server.disconnected_clients.clear()
+        server.process_requests.clear()
+        server.controlled_command_requests.clear()
+        for method in (
+            "register_client",
+            "update_heartbeat",
+            "update_status",
+            "update_metrics",
+            "add_alert",
+        ):
+            active_patch = patch.object(
+                server.db_manager,
+                method,
+                return_value=True,
+            )
+            active_patch.start()
+            self.addCleanup(active_patch.stop)
+        self.client = server.app.test_client()
+
+    def tearDown(self) -> None:
+        server.ADMIN_TOKEN = self.previous_admin_token
+        server.clients.clear()
+        server.clients.update(self.previous_clients)
+        server.disconnected_clients.clear()
+        server.disconnected_clients.update(self.previous_disconnected)
+        server.process_requests.clear()
+        server.process_requests.update(self.previous_process_requests)
+        server.controlled_command_requests.clear()
+        server.controlled_command_requests.update(self.previous_controlled_requests)
+
+    def admin_headers(self) -> dict[str, str]:
+        return {"X-Admin-Token": server.ADMIN_TOKEN}
+
+    def register(self, name: str) -> None:
+        response = server.handle_message(
+            f"REGISTER|{name}|127.0.0.1|8888|PROCESS_LIST_V1|"
+            f"{server.CONTROLLED_COMMANDS_CAPABILITY}",
+            ("127.0.0.1", 30000),
+        )
+        self.assertEqual(response, "OK|REGISTERED")
+
+    def queue(self, name: str, command: str) -> dict[str, Any]:
+        response = self.client.post(
+            f"/api/clients/{name}/commands",
+            headers=self.admin_headers(),
+            json={"command": command},
+        )
+        self.assertEqual(response.status_code, 202)
+        return response.get_json()["request"]
+
+    def deliver_and_reply(
+        self,
+        name: str,
+        command_name: str,
+        *,
+        patches: tuple[Any, ...] = (),
+    ) -> dict[str, Any]:
+        request = self.queue(name, command_name)
+        address = ("127.0.0.1", 30000)
+        command = server.handle_message(f"HEARTBEAT|{name}", address)
+        request_id = request["request_id"]
+        fake_socket = Mock()
+        fake_socket.recv.return_value = b"OK|COMMAND\n"
+        with patches[0] if patches else nullcontext():
+            client_result = tcp_client.TCPClient(
+                default_name=name
+            )._answer_server_command(fake_socket, command, name)
+        self.assertEqual(client_result["status"], "ok")
+        sent_response = fake_socket.sendall.call_args.args[0].decode().strip()
+        self.assertTrue(sent_response.startswith(f"RESPONSE|{request_id}|"))
+        self.assertEqual(server.handle_message(sent_response, address), "OK|COMMAND")
+        result = self.client.get(
+            f"/api/clients/{name}/commands",
+            headers=self.admin_headers(),
+        )
+        self.assertEqual(result.status_code, 200)
+        return result.get_json()["request"]
+
+    def test_admin_api_accepts_only_allowlisted_commands(self) -> None:
+        self.register("allowlist-node")
+        for body, expected in (
+            ({"command": "RUN_SHELL"}, 400),
+            ({"command": "PING", "extra": "value"}, 400),
+            (["PING"], 400),
+        ):
+            response = self.client.post(
+                "/api/clients/allowlist-node/commands",
+                headers=self.admin_headers(),
+                json=body,
+            )
+            self.assertEqual(response.status_code, expected)
+        unauthorized = self.client.post(
+            "/api/clients/allowlist-node/commands",
+            json={"command": "PING"},
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(server.controlled_command_requests, {})
+
+    def test_all_four_commands_return_correlated_validated_results(self) -> None:
+        self.register("command-node")
+        commands = ("PING", "GET_INFO", "GET_PROCESS_LIST", "GET_NETWORK_INFO")
+        for command in commands:
+            patches = []
+            if command == "GET_PROCESS_LIST":
+                patches.append(
+                    patch.object(
+                        tcp_client,
+                        "collect_process_list",
+                        return_value=[self.SAMPLE_PROCESS],
+                    )
+                )
+            elif command == "GET_NETWORK_INFO":
+                patches.append(
+                    patch.object(
+                        tcp_client.TCPClient,
+                        "_collect_network_info",
+                        return_value=self.NETWORK_INFO,
+                    )
+                )
+            with self.subTest(command=command):
+                result = self.deliver_and_reply(
+                    "command-node",
+                    command,
+                    patches=tuple(patches),
+                )
+                self.assertEqual(result["command"], command)
+                self.assertEqual(result["status"], "complete")
+                if command == "PING":
+                    self.assertEqual(result["result"], "PONG")
+                elif command == "GET_INFO":
+                    self.assertEqual(
+                        set(result["result"]),
+                        {
+                            "client_name",
+                            "hostname",
+                            "os",
+                            "os_release",
+                            "machine",
+                            "python_version",
+                        },
+                    )
+                elif command == "GET_PROCESS_LIST":
+                    self.assertEqual(result["result"], [self.SAMPLE_PROCESS])
+                else:
+                    self.assertEqual(result["result"], self.NETWORK_INFO)
+
+    def test_malformed_client_command_and_response_are_rejected(self) -> None:
+        fake_socket = Mock()
+        client = tcp_client.TCPClient(default_name="command-node")
+        rejected = client._answer_server_command(
+            fake_socket,
+            "COMMAND|id-1|RUN_SHELL",
+            "command-node",
+        )
+        self.assertEqual(rejected["status"], "error")
+        fake_socket.sendall.assert_not_called()
+
+        self.register("malformed-node")
+        request = self.queue("malformed-node", "PING")
+        address = ("127.0.0.1", 30000)
+        server.handle_message("HEARTBEAT|malformed-node", address)
+        response = server.handle_message(
+            f"RESPONSE|{request['request_id']}|NOT_PONG",
+            address,
+        )
+        self.assertEqual(response, "ERROR|MALFORMED_COMMAND_RESPONSE")
+        self.assertEqual(
+            server.controlled_command_requests["malformed-node"]["status"],
+            "delivered",
+        )
+
+    def test_command_result_is_bound_to_delivery_peer(self) -> None:
+        self.register("peer-bound-node")
+        request = self.queue("peer-bound-node", "PING")
+        address = ("127.0.0.1", 30000)
+        command = server.handle_message("HEARTBEAT|peer-bound-node", address)
+        response = server.handle_message(
+            f"RESPONSE|{request['request_id']}|PONG",
+            ("127.0.0.1", 30001),
+        )
+        self.assertEqual(response, "ERROR|INVALID_COMMAND_REQUEST")
+        self.assertEqual(
+            server.controlled_command_requests["peer-bound-node"]["status"],
+            "delivered",
+        )
+        self.assertTrue(command.startswith(f"COMMAND|{request['request_id']}|PING"))
+
+    def test_command_timeout_and_disconnect_are_reported(self) -> None:
+        self.register("timeout-node")
+        request = self.queue("timeout-node", "PING")
+        server.controlled_command_requests["timeout-node"]["expires_at"] = (
+            time.monotonic() - 1
+        )
+        self.assertEqual(
+            server.handle_message(
+                "HEARTBEAT|timeout-node",
+                ("127.0.0.1", 30000),
+            ),
+            "OK|HEARTBEAT",
+        )
+        self.assertEqual(
+            server.controlled_command_requests["timeout-node"]["status"],
+            "timeout",
+        )
+        self.assertEqual(
+            self.client.get(
+                "/api/clients/timeout-node/commands",
+                headers=self.admin_headers(),
+            ).get_json()["request"]["status"],
+            "timeout",
+        )
+
+        self.register("disconnect-node")
+        request = self.queue("disconnect-node", "PING")
+        address = ("127.0.0.1", 30000)
+        server.handle_message("HEARTBEAT|disconnect-node", address)
+        server.handle_message("LOGOUT|disconnect-node", address)
+        response = server.handle_message(
+            f"RESPONSE|{request['request_id']}|PONG",
+            address,
+        )
+        self.assertEqual(response, "ERROR|INVALID_COMMAND_REQUEST")
+
+    def test_process_collection_failure_is_reported_without_error_details(self) -> None:
+        self.register("failed-command-node")
+        request = self.queue("failed-command-node", "GET_PROCESS_LIST")
+        address = ("127.0.0.1", 30000)
+        command = server.handle_message(
+            "HEARTBEAT|failed-command-node",
+            address,
+        )
+        fake_socket = Mock()
+        fake_socket.recv.return_value = b"OK|COMMAND\n"
+        with patch.object(
+            tcp_client,
+            "collect_process_list",
+            side_effect=RuntimeError("password must not appear"),
+        ):
+            result = tcp_client.TCPClient(
+                default_name="failed-command-node"
+            )._answer_server_command(fake_socket, command, "failed-command-node")
+
+        sent_response = fake_socket.sendall.call_args.args[0].decode().strip()
+        self.assertEqual(
+            sent_response,
+            f"COMMAND_ERROR|{request['request_id']}|UNAVAILABLE",
+        )
+        self.assertNotIn("password", sent_response)
+        self.assertEqual(server.handle_message(sent_response, address), "OK|COMMAND")
+        self.assertEqual(result["status"], "error")
+        request_status = self.client.get(
+            "/api/clients/failed-command-node/commands",
+            headers=self.admin_headers(),
+        ).get_json()["request"]
+        self.assertEqual(request_status["status"], "error")
+        self.assertIsNone(request_status["result"])
+
+    def test_network_command_reports_first_sample_rates_and_counter_reset(self) -> None:
+        samples = [
+            Mock(bytes_sent=100, bytes_recv=200, packets_sent=3, packets_recv=4),
+            Mock(bytes_sent=160, bytes_recv=240, packets_sent=5, packets_recv=7),
+            Mock(bytes_sent=10, bytes_recv=20, packets_sent=1, packets_recv=2),
+        ]
+        psutil_stub = Mock(net_io_counters=Mock(side_effect=samples))
+        peer = tcp_client.TCPClient(default_name="network-node")
+        with patch.object(tcp_client, "psutil", psutil_stub):
+            with patch.object(
+                tcp_client.time,
+                "monotonic",
+                side_effect=[10.0, 12.0, 14.0],
+            ):
+                first = peer._collect_network_info()
+                second = peer._collect_network_info()
+                reset = peer._collect_network_info()
+
+        self.assertEqual(first["upload_bytes_per_sec"], 0.0)
+        self.assertEqual(first["download_bytes_per_sec"], 0.0)
+        self.assertEqual(second["upload_bytes_per_sec"], 30.0)
+        self.assertEqual(second["download_bytes_per_sec"], 20.0)
+        self.assertEqual(reset["upload_bytes_per_sec"], 0.0)
+        self.assertEqual(reset["download_bytes_per_sec"], 0.0)
+
+    def test_network_command_returns_null_when_counters_are_unavailable(self) -> None:
+        with patch.object(tcp_client, "psutil", None):
+            result = tcp_client.TCPClient()._collect_network_info()
+
+        self.assertEqual(
+            result,
+            {
+                "bytes_sent": None,
+                "bytes_recv": None,
+                "packets_sent": None,
+                "packets_recv": None,
+                "upload_bytes_per_sec": None,
+                "download_bytes_per_sec": None,
+            },
+        )
+
+    def test_ping_command_completes_over_loopback_tcp(self) -> None:
+        stop_listener = threading.Event()
+        handler_threads: list[threading.Thread] = []
+        listener_errors: list[OSError] = []
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(5)
+        listener.settimeout(0.1)
+
+        def accept_connections() -> None:
+            while not stop_listener.is_set():
+                try:
+                    connection, address = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError as error:
+                    if not stop_listener.is_set():
+                        listener_errors.append(error)
+                    return
+                handler = threading.Thread(
+                    target=server.tcp_client_session,
+                    args=(connection, address),
+                )
+                handler_threads.append(handler)
+                handler.start()
+
+        accept_thread = threading.Thread(target=accept_connections)
+        accept_thread.start()
+        peer = tcp_client.TCPClient(
+            host="127.0.0.1",
+            port=listener.getsockname()[1],
+            default_name="loopback-command-node",
+        )
+        try:
+            self.assertEqual(peer.register()["status"], "ok")
+            queued = self.queue("loopback-command-node", "PING")
+            heartbeat = peer.heartbeat()
+            self.assertEqual(heartbeat["status"], "ok")
+            self.assertEqual(heartbeat["command_status"], "complete")
+            self.assertEqual(heartbeat["raw"], "OK|COMMAND")
+            result = self.client.get(
+                "/api/clients/loopback-command-node/commands",
+                headers=self.admin_headers(),
+            ).get_json()["request"]
+            self.assertEqual(result["request_id"], queued["request_id"])
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["result"], "PONG")
+        finally:
+            stop_listener.set()
+            listener.close()
+            accept_thread.join(timeout=2)
+            self.assertFalse(accept_thread.is_alive())
+            for handler in handler_threads:
+                handler.join(timeout=2)
+                self.assertFalse(handler.is_alive())
+            self.assertEqual(listener_errors, [])
 
 
 class ProcessCollectorTests(unittest.TestCase):

@@ -201,18 +201,23 @@ Giao tiếp qua TCP sử dụng chuỗi ký tự UTF-8 phân tách bằng dấu 
 
 | Lệnh | Định dạng gửi từ Client | Phản hồi từ Server | Ý nghĩa |
 | :--- | :--- | :--- | :--- |
-| **REGISTER** | `REGISTER\|<client_name>\|<ip>\|<port>` hoặc thêm `\|PROCESS_LIST_V1` | `OK\|REGISTERED` | Đăng ký thiết bị; client mới quảng bá khả năng nhận yêu cầu danh sách tiến trình |
+| **REGISTER** | `REGISTER\|<client_name>\|<ip>\|<port>` hoặc thêm `\|PROCESS_LIST_V1\|CONTROLLED_COMMANDS_V1` | `OK\|REGISTERED` | Đăng ký thiết bị và quảng bá các khả năng được hỗ trợ |
 | **SYSTEM** | `SYSTEM\|<client_name>\|CPU=<cpu>\|RAM=<ram>\|DISK=<disk>\|NETWORK=<net>\|UPLOAD_BPS=<bytes_per_sec>\|DOWNLOAD_BPS=<bytes_per_sec>\|PACKETS_SENT=<count>\|PACKETS_RECV=<count>` | `OK\|SYSTEM` | Cập nhật tài nguyên và lưu lượng mạng; các trường mới có thể là `null` khi không khả dụng |
-| **HEARTBEAT**| `HEARTBEAT\|<client_name>` | `OK\|HEARTBEAT` hoặc `COMMAND\|GET_PROCESS_LIST\|<request_id>\|<limit>` | Duy trì trạng thái sống; nếu có yêu cầu đang chờ, server gửi lệnh cố định trên kết nối này |
+| **HEARTBEAT**| `HEARTBEAT\|<client_name>` | `OK\|HEARTBEAT` hoặc `COMMAND\|<request_id>\|<allowed_command>` | Duy trì trạng thái sống; server có thể gửi một lệnh cố định đang chờ trên kết nối này |
 | **LOGOUT** | `LOGOUT\|<client_name>` | `OK\|LOGOUT` | Ngắt kết nối, chuyển trạng thái sang `OFFLINE` |
 | **PROCESS_LIST** | `PROCESS_LIST\|<client_name>\|<request_id>\|<JSON>` | `OK\|PROCESS_LIST` | Client trả tối đa 20 tiến trình với `pid`, `name`, `username`, `cpu_percent`, `memory_percent`, `status` |
 | **PROCESS_LIST_ERROR** | `PROCESS_LIST_ERROR\|<client_name>\|<request_id>\|UNAVAILABLE` | `OK\|PROCESS_LIST` | Client báo không thể thu thập thông tin tiến trình |
+| **COMMAND** | `COMMAND\|<request_id>\|PING`, `GET_INFO`, `GET_PROCESS_LIST\|<limit>` hoặc `GET_NETWORK_INFO` | `OK\|COMMAND` | Server chỉ gửi một trong bốn lệnh được cho phép, thông qua heartbeat kế tiếp |
+| **RESPONSE** | `RESPONSE\|<request_id>\|<result>` | `OK\|COMMAND` | Trả kết quả được correlation theo request ID; dữ liệu tiến trình/máy/mạng là JSON |
+| **COMMAND_ERROR** | `COMMAND_ERROR\|<request_id>\|UNAVAILABLE` | `OK\|COMMAND` | Báo lệnh không thể hoàn tất; không gửi nội dung nhạy cảm trong thông báo lỗi |
 
 ---
 
 `UPLOAD_BPS` và `DOWNLOAD_BPS` là tốc độ byte/giây tính từ chênh lệch bộ đếm và thời gian giữa hai lần đo; `PACKETS_SENT` và `PACKETS_RECV` là tổng bộ đếm gói tại lần đo hiện tại. Các giá trị là tổng hợp trên toàn máy, không tách theo giao diện mạng. Mẫu đầu tiên hoặc bộ đếm bị reset có tốc độ `0`; nếu bộ đếm không khả dụng, các trường mới được gửi là `null`. `NETWORK=<net>` vẫn được giữ để tương thích với server cũ; dashboard mới không dùng trường legacy này để biểu diễn thông lượng. Client cũ chỉ gửi các trường CPU/RAM/Disk/NETWORK vẫn được chấp nhận.
 
-Yêu cầu tiến trình chỉ được gửi tới client đã đăng ký và quảng bá `PROCESS_LIST_V1`; lệnh được giao ở heartbeat kế tiếp và hết hạn sau 30 giây. Server chỉ chấp nhận `GET_PROCESS_LIST`, không thực thi shell hay lệnh tùy ý. Request và kết quả được giữ trong bộ nhớ máy chủ, không lưu vào MySQL. Các endpoint yêu cầu tiến trình/kết quả dùng header `X-Admin-Token`; danh tính client hiện tại chỉ dựa trên tên đăng ký, chưa có xác thực mật mã cho client.
+Các lệnh server-to-client chỉ gồm `PING`, `GET_INFO`, `GET_PROCESS_LIST` và `GET_NETWORK_INFO`; không hỗ trợ shell, Python hay thực thi lệnh tùy ý. Client mới quảng bá `CONTROLLED_COMMANDS_V1`; lệnh được xếp hàng và gửi ở heartbeat kế tiếp, mỗi client chỉ có tối đa một request đang chờ. Request hết hạn sau 15 giây. `GET_PROCESS_LIST` vẫn giới hạn tối đa 20 tiến trình. `GET_INFO` chỉ trả tên client, hostname, hệ điều hành/release, kiến trúc máy và phiên bản Python; không trả username, đường dẫn, biến môi trường hoặc định danh phần cứng. `GET_NETWORK_INFO` trả bộ đếm mạng tổng hợp và tốc độ ước tính kể từ mẫu trước; trường không khả dụng là `null`.
+
+Các endpoint `/api/clients/<name>/commands` dùng `POST` với JSON `{"command":"PING"}` để xếp lệnh, và `GET` để xem trạng thái/kết quả; cả hai yêu cầu header `X-Admin-Token`. Request và kết quả chỉ được giữ tạm trong bộ nhớ máy chủ, không ghi MySQL. Danh tính client hiện chỉ dựa trên tên đăng ký, chưa có xác thực mật mã hay mã hóa TLS; chỉ dùng tính năng quản trị trên mạng tin cậy. Client cũ không quảng bá khả năng lệnh vẫn dùng được với các chức năng TCP hiện tại nhưng không nhận các lệnh mới.
 
 ## 🌐 Danh sách REST APIs
 
@@ -221,6 +226,8 @@ Yêu cầu tiến trình chỉ được gửi tới client đã đăng ký và q
 | `/api/health` | GET | Kiểm tra trạng thái máy chủ và thông tin cổng đang lắng nghe |
 | `/api/clients` | GET | Danh sách client, trạng thái và metrics mới nhất, gồm `upload_bytes_per_sec`, `download_bytes_per_sec`, `packets_sent`, `packets_recv` |
 | `/api/clients/<name>/history` | GET | Lịch sử tối đa 120 mẫu, gồm tốc độ upload/download và bộ đếm gói nếu có |
+| `/api/clients/<name>/commands` | POST | Xếp một lệnh cố định (`PING`, `GET_INFO`, `GET_PROCESS_LIST`, `GET_NETWORK_INFO`) cho client; yêu cầu `X-Admin-Token` |
+| `/api/clients/<name>/commands` | GET | Lấy trạng thái/kết quả request lệnh mới nhất; yêu cầu `X-Admin-Token` |
 | `/api/alerts` | GET | Danh sách các cảnh báo vượt ngưỡng tài nguyên gần nhất |
 | `/api/clients/<name>/disconnect` | POST | Ngắt một client; yêu cầu header `X-Admin-Token: <MONITOR_ADMIN_TOKEN>` |
 | `/api/clients/<name>/process-list` | POST | Yêu cầu client gửi danh sách tối đa 20 tiến trình; cần admin token |
