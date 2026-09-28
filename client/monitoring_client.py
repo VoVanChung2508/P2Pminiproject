@@ -45,6 +45,12 @@ DEFAULT_HTTP_PORT = int(os.environ.get("MONITOR_HTTP_PORT", "8081"))
 DEFAULT_TCP_PORT = int(os.environ.get("MONITOR_TCP_PORT", "8888"))
 
 
+def was_disconnected_by_server(response: Dict[str, Any]) -> bool:
+    raw = str(response.get("raw", "")).strip().upper()
+    message = str(response.get("message", "")).strip().upper()
+    return raw == "ERROR|DISCONNECTED" or message == "DISCONNECTED"
+
+
 # ============================================================================
 # 1. CORE CLIENT ENGINE (NetworkMonitoringClient)
 # ============================================================================
@@ -400,9 +406,15 @@ class ClientGUI:
 
                 # Send metrics
                 res_metric = self.client.send_metrics(**metrics)
+                if was_disconnected_by_server(res_metric):
+                    self.root.after(0, self._handle_server_disconnect)
+                    break
 
                 # Send heartbeat
                 res_hb = self.client.send_heartbeat()
+                if was_disconnected_by_server(res_hb):
+                    self.root.after(0, self._handle_server_disconnect)
+                    break
 
                 self.root.after(
                     0,
@@ -451,6 +463,17 @@ class ClientGUI:
         self.status_var.set("Trạng thái: ĐÃ NGẮT KẾT NỐI (OFFLINE)")
         self.status_label.configure(foreground="#dc2626")
 
+    def _handle_server_disconnect(self) -> None:
+        if not self.is_monitoring:
+            return
+        self.is_monitoring = False
+        self.append_log("Server đã chủ động ngắt client này. Hãy kết nối lại thủ công nếu cần.")
+        self.set_inputs_enabled(True)
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.status_var.set("Trạng thái: BỊ SERVER NGẮT (OFFLINE)")
+        self.status_label.configure(foreground="#dc2626")
+
     def on_close(self) -> None:
         if self.is_monitoring:
             self.stop_monitoring()
@@ -497,7 +520,13 @@ def run_cli(
         while True:
             metrics = client.collect_system_metrics()
             metric_res = client.send_metrics(**metrics)
+            if was_disconnected_by_server(metric_res):
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Server đã ngắt client; dừng giám sát.")
+                return
             hb_res = client.send_heartbeat()
+            if was_disconnected_by_server(hb_res):
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Server đã ngắt client; dừng giám sát.")
+                return
 
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "

@@ -152,12 +152,7 @@ class ServerManagerGUI:
             messagebox.showerror("Lỗi", "Số cổng TCP và HTTP phải là số nguyên hợp lệ.")
             return
 
-        main_script = PROJECT_ROOT / "Main.py"
-        if not main_script.exists():
-            messagebox.showerror("Lỗi", f"Không tìm thấy tệp {main_script}")
-            return
-
-        # Pre-flight check port availability
+        # Kiểm tra cổng trước khi khởi động server nền
         if not is_port_available(tcp_port):
             free_tcp = find_available_port(tcp_port + 1)
             if messagebox.askyesno(
@@ -188,7 +183,7 @@ class ServerManagerGUI:
         env["MONITOR_TCP_PORT"] = str(tcp_port)
 
         self.process = subprocess.Popen(
-            [sys.executable, str(main_script)],
+            [sys.executable, "-m", "server.server"],
             cwd=str(PROJECT_ROOT),
             env=env,
             text=True,
@@ -210,7 +205,7 @@ class ServerManagerGUI:
             self.root.after(
                 0,
                 self.write_log,
-                f"Tiến trình Server dừng với mã lỗi {code}. Vui lòng kiểm tra xung đột cổng.",
+                f"Tiến trình Server dừng với mã lỗi {code}. Xem các dòng lỗi phía trên để biết nguyên nhân.",
             )
 
     def stop_server(self) -> None:
