@@ -21,6 +21,8 @@ _project_root = os.path.abspath(os.path.join(_current_dir, ".."))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from common.logging_config import configure_logging
+
 try:
     from client.http_client import HTTPClient
     from client.tcp_client import TCPClient
@@ -102,14 +104,47 @@ class NetworkMonitoringClient:
     def register(self) -> Dict[str, Any]:
         """Register client with the monitoring TCP server."""
         if self.tcp_client:
-            return self.tcp_client.register(self.name, host=self.host, port=self.tcp_port)
-        return self._raw_tcp_send(f"REGISTER|{self.name}|{self.host}|{self.tcp_port}")
+            result = self.tcp_client.register(
+                self.name,
+                host=self.host,
+                port=self.tcp_port,
+            )
+        else:
+            result = self._raw_tcp_send(
+                f"REGISTER|{self.name}|{self.host}|{self.tcp_port}"
+            )
+        if result.get("status") == "ok":
+            logger.info(
+                "Client %s registered with monitoring server at %s:%s.",
+                self.name,
+                self.host,
+                self.tcp_port,
+            )
+        else:
+            logger.warning(
+                "Client %s registration failed (%s).",
+                self.name,
+                result.get("status", "error"),
+            )
+        return result
 
     def send_heartbeat(self) -> Dict[str, Any]:
         """Send HEARTBEAT message to maintain ONLINE status."""
         if self.tcp_client:
-            return self.tcp_client.heartbeat(self.name)
-        return self._raw_tcp_send(f"HEARTBEAT|{self.name}")
+            result = self.tcp_client.heartbeat(self.name)
+        else:
+            result = self._raw_tcp_send(f"HEARTBEAT|{self.name}")
+        if was_disconnected_by_server(result):
+            logger.warning("Server disconnected client %s.", self.name)
+        elif result.get("status") != "ok":
+            logger.warning(
+                "Client %s heartbeat failed (%s).",
+                self.name,
+                result.get("status", "error"),
+            )
+        else:
+            logger.debug("Client %s heartbeat completed.", self.name)
+        return result
 
     def send_metrics(
         self,
@@ -253,8 +288,18 @@ class NetworkMonitoringClient:
     def disconnect(self) -> Dict[str, Any]:
         """Send LOGOUT message to notify server before exiting."""
         if self.tcp_client:
-            return self.tcp_client.disconnect(self.name)
-        return self._raw_tcp_send(f"LOGOUT|{self.name}")
+            result = self.tcp_client.disconnect(self.name)
+        else:
+            result = self._raw_tcp_send(f"LOGOUT|{self.name}")
+        if result.get("status") == "ok":
+            logger.info("Client %s disconnected from monitoring server.", self.name)
+        else:
+            logger.warning(
+                "Client %s disconnect request failed (%s).",
+                self.name,
+                result.get("status", "error"),
+            )
+        return result
 
     def _raw_tcp_send(self, message: str) -> Dict[str, Any]:
         """Fallback raw socket sender if tcp_client is unavailable."""
@@ -593,6 +638,8 @@ def run_cli(
     interval: int = 3,
 ) -> None:
     """Run monitoring agent in command-line mode without GUI."""
+    configure_logging("client")
+    logger.info("Starting client CLI for %s at %s:%s.", name, host, port)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Khởi động Client CLI: '{name}'")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Kết nối đến Monitoring Server tại {host}:{port}...")
 
@@ -603,14 +650,21 @@ def run_cli(
         health_res = client.health()
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Server Health Check: {health_res}")
     except Exception as exc:
+        logger.warning(
+            "Client %s health check failed (%s).",
+            name,
+            type(exc).__name__,
+        )
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Cảnh báo Health check: {exc}")
 
     # Register
     reg_res = client.register()
     if reg_res.get("status") != "ok":
+        logger.error("Client %s could not register with the server.", name)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] LỖI: Đăng ký thất bại: {reg_res.get('message', 'Không kết nối được server')}")
         sys.exit(1)
 
+    logger.info("Client %s monitoring loop started.", name)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] REGISTER: {reg_res.get('message', 'OK')}")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Đang gửi dữ liệu định kỳ mỗi {interval}s (Bấm Ctrl+C để dừng)...")
 
@@ -619,10 +673,12 @@ def run_cli(
             metrics = client.collect_system_metrics()
             metric_res = client.send_metrics(**metrics)
             if was_disconnected_by_server(metric_res):
+                logger.warning("Server disconnected client %s during metrics send.", name)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Server đã ngắt client; dừng giám sát.")
                 return
             hb_res = client.send_heartbeat()
             if was_disconnected_by_server(hb_res):
+                logger.warning("Server disconnected client %s during heartbeat.", name)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Server đã ngắt client; dừng giám sát.")
                 return
 
@@ -638,12 +694,19 @@ def run_cli(
             )
             time.sleep(interval)
     except KeyboardInterrupt:
+        logger.info("Client %s received a graceful shutdown signal.", name)
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Nhận tín hiệu dừng, gửi lệnh LOGOUT...")
         try:
             logout_res = client.disconnect()
             print(f"[{datetime.now().strftime('%H:%M:%S')}] LOGOUT: {logout_res.get('message', 'OK')}")
         except Exception as exc:
+            logger.error(
+                "Client %s logout failed (%s).",
+                name,
+                type(exc).__name__,
+            )
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Lỗi gửi LOGOUT: {exc}")
+        logger.info("Client %s stopped.", name)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Client Agent đã dừng an toàn.")
 
 
@@ -652,6 +715,7 @@ def run_cli(
 # ============================================================================
 
 def main() -> None:
+    configure_logging("client")
     parser = argparse.ArgumentParser(
         description="Network Monitoring System - Client Agent (Hỗ trợ cả GUI và CLI)",
         formatter_class=argparse.RawDescriptionHelpFormatter,

@@ -132,7 +132,24 @@ export MONITOR_ADMIN_TOKEN="replace-with-a-long-random-token"
 
 Nếu chưa cấu hình khóa, server vẫn khởi động nhưng thao tác ngắt client bị vô hiệu hóa. API quản trị chỉ nên sử dụng trên mạng tin cậy; HTTP mặc định không mã hóa khóa.
 
-### 4. Cấu trúc Các Bảng Dữ liệu (Schema)
+### 4. Nhật ký ứng dụng
+Server và client ghi log ra console và các file xoay vòng riêng biệt:
+
+- Server: `logs/server.log` (mặc định), có thể đổi bằng `LOG_FILE`.
+- Client: `logs/client.log` (mặc định), có thể đổi bằng `CLIENT_LOG_FILE`.
+- `LOG_LEVEL` đặt mức chung cho cả hai tiến trình: `DEBUG`, `INFO`, `WARNING`, `ERROR` hoặc `CRITICAL` (mặc định `INFO`). Giá trị không hợp lệ tạo cảnh báo và dùng `INFO`.
+- Mỗi file tối đa 5 MiB, giữ tối đa 3 file cũ. Thư mục log được tạo khi cấu hình logging khởi chạy.
+
+Ví dụ PowerShell:
+```powershell
+$env:LOG_LEVEL="DEBUG"
+$env:LOG_FILE="logs/server.log"
+$env:CLIENT_LOG_FILE="logs/client.log"
+```
+
+Giữ các file log cục bộ và không chia sẻ chúng nếu có thông tin vận hành nhạy cảm. Logger được cấu hình để che các giá trị password/token thường gặp; mã cũng tránh ghi token, header xác thực, payload lệnh hoặc thông điệp lỗi thô. CLI vẫn in trạng thái và số liệu để người vận hành theo dõi tương tác.
+
+### 5. Cấu trúc Các Bảng Dữ liệu (Schema)
 Khi `MYSQL_CREATE_DATABASE` bật, hệ thống tự tạo database `network_monitor` nếu chưa có. Dù database được tạo tự động hay có sẵn từ Workbench, server sẽ tạo các bảng ứng dụng còn thiếu:
 - **`clients`**: Lưu danh sách máy trạm (`client_key`, `name`, `ip`, `cpu`, `ram`, `disk`, `network`, `upload_bytes_per_sec`, `download_bytes_per_sec`, `packets_sent`, `packets_recv`, `status`, `last_seen`, `registered_at`).
 - **`history`**: Lưu lịch sử biến động chỉ số tài nguyên và mạng (`client_key`, `cpu`, `ram`, `disk`, `network`, `upload_bytes_per_sec`, `download_bytes_per_sec`, `packets_sent`, `packets_recv`, `timestamp`).

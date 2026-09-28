@@ -87,16 +87,31 @@ class TCPClient:
         return str(action)
 
     def send(self, action: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        operation = action if action in {"REGISTER", "HEARTBEAT", "SYSTEM", "LOGOUT"} else "unknown"
         try:
             with socket.create_connection((self.host, self.port), timeout=5) as sock:
                 if action == "HEARTBEAT":
                     sock.settimeout(PROCESS_LIST_SOCKET_TIMEOUT_SECONDS)
                 message = self._build_message(action, payload)
+                logger.debug(
+                    "Sending %s request to monitoring server at %s:%s.",
+                    operation,
+                    self.host,
+                    self.port,
+                )
                 sock.sendall((message + "\n").encode("utf-8"))
                 raw = self._read_line(sock)
                 if raw is None:
+                    logger.warning(
+                        "No response to %s request from monitoring server.",
+                        operation,
+                    )
                     return {"status": "error", "message": "No response from server"}
                 if not raw:
+                    logger.warning(
+                        "Empty response to %s request from monitoring server.",
+                        operation,
+                    )
                     return {"status": "error", "message": "Empty server response"}
                 if action == "HEARTBEAT" and raw.startswith("COMMAND|"):
                     client_name = str(
@@ -107,8 +122,21 @@ class TCPClient:
                         raw,
                         client_name,
                     )
-                return self._response_result(raw)
+                result = self._response_result(raw)
+                if result["status"] == "ok":
+                    logger.debug("Monitoring server accepted %s request.", operation)
+                else:
+                    logger.warning(
+                        "Monitoring server rejected %s request.",
+                        operation,
+                    )
+                return result
         except (OSError, socket.timeout) as exc:
+            logger.warning(
+                "TCP %s request failed (%s).",
+                operation,
+                type(exc).__name__,
+            )
             return {"status": "error", "message": str(exc)}
         except ValueError as exc:
             logger.warning("Rejected oversized or malformed TCP response (%s).", type(exc).__name__)
@@ -174,6 +202,7 @@ class TCPClient:
 
         request_id = parts[1]
         command_name = parts[2]
+        logger.info("Executing allowlisted server command %s.", command_name)
         try:
             if command_name == "PING":
                 response_payload = "PONG"
@@ -225,6 +254,10 @@ class TCPClient:
         command_succeeded = (
             ack_result["status"] == "ok" and response.startswith("RESPONSE|")
         )
+        if command_succeeded:
+            logger.info("Controlled command %s completed.", command_name)
+        else:
+            logger.warning("Controlled command %s did not complete.", command_name)
         return {
             "status": "ok" if command_succeeded else "error",
             "raw": acknowledgement,

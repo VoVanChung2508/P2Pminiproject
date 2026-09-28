@@ -8,12 +8,12 @@ import socket
 import threading
 import time
 import uuid
-from datetime import datetime
 from os import environ
 from typing import Any
 
 from flask import Flask, jsonify, render_template_string, request
 from common.database import DatabaseManager
+from common.logging_config import configure_logging
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = int(environ.get("MONITOR_HTTP_PORT", "8081"))
@@ -45,10 +45,6 @@ process_requests: dict[str, dict[str, Any]] = {}
 controlled_command_requests: dict[str, dict[str, Any]] = {}
 
 db_manager = DatabaseManager()
-
-
-def log(message: str) -> None:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
 
 def client_snapshot(client: dict[str, Any], runtime: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -107,7 +103,7 @@ def register_client(
             "process_list_capable": process_list_capable,
             "controlled_commands_capable": controlled_commands_capable,
         }
-    log(f"{name} registered from {ip}")
+    logger.info("Client %s registered from %s.", name, ip)
 
 
 def update_system(name: str, metrics: dict[str, float]) -> bool:
@@ -638,7 +634,7 @@ def disconnect_client(name: str) -> bool:
     with state_lock:
         disconnected_clients.add(key)
         client["status"] = "OFFLINE"
-    log(f"{client['name']} disconnected by server administrator")
+    logger.info("Client %s disconnected by server administrator.", client["name"])
     return True
 
 
@@ -650,9 +646,15 @@ def mark_offline_clients() -> None:
             for client in clients.values():
                 if current_time - client["last_seen_epoch"] > HEARTBEAT_TIMEOUT:
                     if client["status"] != "OFFLINE":
-                        log(f"{client['name']} -> OFFLINE")
+                        logger.warning(
+                            "Client %s marked OFFLINE after heartbeat timeout.",
+                            client["name"],
+                        )
                         if not db_manager.update_status(client['name'], "OFFLINE"):
-                            log("ERROR: Could not save OFFLINE status to MySQL.")
+                            logger.error(
+                                "Could not save OFFLINE status for client %s to MySQL.",
+                                client["name"],
+                            )
                     client["status"] = "OFFLINE"
 
 
@@ -737,13 +739,27 @@ def handle_message(message: str, address: tuple[str, int]) -> str:
         if command == "HEARTBEAT" and len(parts) >= 2:
             if not touch_client(parts[1]):
                 reason = "DISCONNECTED" if is_client_disconnected(parts[1]) else "NOT_REGISTERED"
+                logger.warning(
+                    "Rejected heartbeat for client %s (%s).",
+                    parts[1],
+                    reason,
+                )
                 return f"ERROR|{reason}"
             controlled_command = _next_controlled_command(parts[1], address)
             if controlled_command is not None:
+                logger.info(
+                    "Delivered controlled command to client %s on heartbeat.",
+                    parts[1],
+                )
                 return controlled_command
             process_command = _next_process_command(parts[1], address)
             if process_command is not None:
+                logger.info(
+                    "Delivered process-list request to client %s on heartbeat.",
+                    parts[1],
+                )
                 return process_command
+            logger.debug("Heartbeat received from client %s.", parts[1])
             return "OK|HEARTBEAT"
         if command == "SYSTEM" and len(parts) >= 2:
             metrics: dict[str, float | int | None] = {}
@@ -782,13 +798,23 @@ def handle_message(message: str, address: tuple[str, int]) -> str:
                     raise RuntimeError("MySQL did not save the client logout.")
                 with state_lock:
                     client["status"] = "OFFLINE"
+                logger.info("Client %s logged out.", client["name"])
             return "OK|LOGOUT"
         return "ERROR|Unsupported message"
     except (ValueError, IndexError) as exc:
-
+        logger.warning(
+            "Rejected malformed %s message from %s:%s (%s).",
+            command if command in {"REGISTER", "SYSTEM", "HEARTBEAT", "LOGOUT"} else "unknown",
+            address[0],
+            address[1],
+            type(exc).__name__,
+        )
         return f"ERROR|{exc}"
     except RuntimeError as exc:
-        log(f"Database operation failed: {exc}")
+        logger.error(
+            "Database operation failed while handling client message (%s).",
+            type(exc).__name__,
+        )
         return "ERROR|DATABASE_UNAVAILABLE"
 
 
@@ -891,7 +917,7 @@ def tcp_server() -> None:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((TCP_HOST, TCP_PORT))
         server_socket.listen(50)
-        log(f"Monitoring TCP server listening on {TCP_PORT}")
+        logger.info("Monitoring TCP server listening on port %s.", TCP_PORT)
         while True:
             try:
                 connection, address = server_socket.accept()
@@ -949,9 +975,21 @@ def ensure_ports_available() -> None:
                 env_key = f"MONITOR_{service}_PORT"
                 free_port = find_available_port(8081 if port == 8080 else port + 1)
                 if env_key not in environ:
-                    log(f"Port {port} for {service} is occupied ({exc}). Auto-switching to port {free_port}.")
+                    logger.warning(
+                        "Port %s for %s is occupied (%s); switching to port %s.",
+                        port,
+                        service,
+                        type(exc).__name__,
+                        free_port,
+                    )
                     globals()[port_var_name] = free_port
                     continue
+                logger.error(
+                    "Cannot start %s service on occupied port %s (%s).",
+                    service,
+                    port,
+                    type(exc).__name__,
+                )
                 raise SystemExit(
                     f"Cannot start {service} service on port {port}: {exc}. "
                     f"Set {env_key} to a free port (e.g., {free_port})."
@@ -985,6 +1023,10 @@ def api_clients():
     try:
         stored_clients = db_manager.get_clients()
     except RuntimeError as exc:
+        logger.error(
+            "API client-list read failed (%s).",
+            type(exc).__name__,
+        )
         return jsonify({"status": "error", "message": str(exc)}), 503
     with state_lock:
         result = [
@@ -1002,6 +1044,11 @@ def api_client_history(name: str):
     try:
         samples = db_manager.get_history(name, SAMPLE_LIMIT)
     except RuntimeError as exc:
+        logger.error(
+            "API history read failed for client %s (%s).",
+            name,
+            type(exc).__name__,
+        )
         return jsonify({"status": "error", "message": str(exc)}), 503
     return jsonify({"client": name, "samples": samples})
 
@@ -1011,15 +1058,21 @@ def api_alerts():
     try:
         stored_alerts = db_manager.get_alerts(100)
     except RuntimeError as exc:
+        logger.error(
+            "API alert read failed (%s).",
+            type(exc).__name__,
+        )
         return jsonify({"status": "error", "message": str(exc)}), 503
     return jsonify({"alerts": stored_alerts})
 
 
 def _admin_token_error() -> tuple[str, int] | None:
     if not ADMIN_TOKEN:
+        logger.warning("Rejected admin API request because no admin token is configured.")
         return "Server admin token is not configured", 503
     supplied_token = request.headers.get("X-Admin-Token", "")
     if not hmac.compare_digest(supplied_token, ADMIN_TOKEN):
+        logger.warning("Rejected admin API request due to invalid credentials.")
         return "Invalid admin token", 401
     return None
 
@@ -1089,6 +1142,10 @@ def api_controlled_commands(name: str):
     if request.method == "POST":
         body = request.get_json(silent=True)
         if not isinstance(body, dict) or set(body) != {"command"}:
+            logger.warning(
+                "Rejected malformed controlled-command API request for client %s.",
+                name,
+            )
             return jsonify(
                 {
                     "status": "error",
@@ -1098,6 +1155,10 @@ def api_controlled_commands(name: str):
             ), 400
         command = body["command"]
         if not isinstance(command, str) or command not in CONTROLLED_COMMANDS:
+            logger.warning(
+                "Rejected unsupported controlled-command API request for client %s.",
+                name,
+            )
             return jsonify(
                 {
                     "status": "error",
@@ -1137,6 +1198,11 @@ def api_controlled_commands(name: str):
                 if error_code == "COMMAND_CAPACITY"
                 else 409
             )
+            logger.warning(
+                "Could not queue controlled command for client %s (%s).",
+                name,
+                error_code,
+            )
             return jsonify(
                 {
                     "status": "error",
@@ -1171,7 +1237,18 @@ def api_disconnect_client(name: str):
     if auth_error is not None:
         message, status_code = auth_error
         return jsonify({"status": "error", "message": message}), status_code
-    if not disconnect_client(name):
+    try:
+        disconnected = disconnect_client(name)
+    except RuntimeError as error:
+        logger.error(
+            "API client disconnect failed for %s (%s).",
+            name,
+            type(error).__name__,
+        )
+        return jsonify(
+            {"status": "error", "message": "Could not disconnect client"}
+        ), 503
+    if not disconnected:
         return jsonify({"status": "error", "message": "Client not found"}), 404
     return jsonify({"status": "ok", "message": f"Client {name} disconnected"})
 
@@ -1595,20 +1672,33 @@ def start_services() -> None:
 
     This module contains server services only; it never creates the desktop GUI.
     """
+    configure_logging("server")
     ensure_ports_available()
-    log(f"Starting monitoring services: TCP={TCP_PORT}, HTTP={HTTP_PORT}")
+    logger.info(
+        "Starting monitoring services: TCP=%s, HTTP=%s.",
+        TCP_PORT,
+        HTTP_PORT,
+    )
     if not db_manager.connect():
+        logger.error(
+            "MySQL is unavailable; server will not start without persistent storage."
+        )
         raise SystemExit("MySQL is required; server will not start without persistent database storage.")
     if not db_manager.mark_all_clients_offline():
         db_manager.close()
+        logger.error(
+            "Could not initialize client statuses in MySQL; server will not start."
+        )
         raise SystemExit("Could not initialize client statuses in MySQL; server will not start.")
     if not ADMIN_TOKEN:
-        log("WARNING: MONITOR_ADMIN_TOKEN is not configured; dashboard disconnect is disabled.")
+        logger.warning(
+            "MONITOR_ADMIN_TOKEN is not configured; dashboard disconnect is disabled."
+        )
 
     threading.Thread(target=mark_offline_clients, daemon=True).start()
     threading.Thread(target=tcp_server, daemon=True).start()
 
-    log(f"HTTP dashboard listening on {HTTP_PORT}")
+    logger.info("HTTP dashboard listening on port %s.", HTTP_PORT)
     app.run(
         host=HTTP_HOST,
         port=HTTP_PORT,

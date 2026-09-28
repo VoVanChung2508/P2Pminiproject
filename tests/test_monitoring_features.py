@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+import logging
 import os
 import socket
 import threading
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 from client import monitoring_client, process_monitor, tcp_client
 from common import database
+from common import logging_config
 from server import server
 from server import server_gui
 
@@ -43,6 +45,225 @@ def open_tcp_session() -> tuple[socket.socket, socket.socket, threading.Thread]:
 def exchange_tcp_message(client_socket: socket.socket, message: str) -> str:
     client_socket.sendall((message + "\n").encode("utf-8"))
     return client_socket.recv(4096).decode("utf-8").strip()
+
+
+class LoggingConfigurationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root_logger = logging.getLogger()
+        self.previous_handlers = list(self.root_logger.handlers)
+        self.previous_level = self.root_logger.level
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.log_directory = Path(self.temporary_directory.name)
+        self.previous_clients = copy.deepcopy(server.clients)
+        self.previous_disconnected = set(server.disconnected_clients)
+
+    def tearDown(self) -> None:
+        server.clients.clear()
+        server.clients.update(self.previous_clients)
+        server.disconnected_clients.clear()
+        server.disconnected_clients.update(self.previous_disconnected)
+        for handler in list(self.root_logger.handlers):
+            if handler not in self.previous_handlers:
+                self.root_logger.removeHandler(handler)
+                handler.close()
+        self.root_logger.setLevel(self.previous_level)
+
+    def test_configures_console_rotating_file_level_and_is_idempotent(self) -> None:
+        log_path = self.log_directory / "server.log"
+        with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}, clear=False):
+            logging_config.configure_logging("server", log_path)
+            first_handlers = list(self.root_logger.handlers)
+            logging_config.configure_logging("server", log_path)
+
+        self.assertEqual(self.root_logger.level, logging.DEBUG)
+        monitor_handlers = [
+            handler
+            for handler in self.root_logger.handlers
+            if getattr(handler, "_monitor_console_handler", False)
+            or getattr(handler, "_monitor_log_path", None) == str(log_path.resolve())
+        ]
+        self.assertEqual(len(monitor_handlers), 2)
+        self.assertEqual(len(first_handlers), len(self.root_logger.handlers))
+        file_handler = next(
+            handler
+            for handler in monitor_handlers
+            if isinstance(handler, logging_config.RotatingFileHandler)
+        )
+        self.assertEqual(file_handler.maxBytes, logging_config.MAX_LOG_BYTES)
+        self.assertEqual(file_handler.backupCount, logging_config.BACKUP_COUNT)
+        self.assertTrue(log_path.is_file())
+
+    def test_invalid_level_falls_back_to_info_and_logs_warning(self) -> None:
+        log_path = self.log_directory / "invalid-level.log"
+        with patch.dict(os.environ, {"LOG_LEVEL": "NOT_A_LEVEL"}, clear=False):
+            logging_config.configure_logging("client", log_path)
+        for handler in self.root_logger.handlers:
+            handler.flush()
+
+        self.assertEqual(self.root_logger.level, logging.INFO)
+        self.assertIn("Invalid LOG_LEVEL", log_path.read_text(encoding="utf-8"))
+
+    def test_logging_events_write_to_file_and_redact_secrets_and_tracebacks(self) -> None:
+        log_path = self.log_directory / "safe.log"
+        logging_config.configure_logging("server", log_path)
+        logger = logging.getLogger("logging-test")
+        logger.info(
+            "Client registered; MYSQL_PASSWORD=%s MONITOR_ADMIN_TOKEN=%s",
+            "db-secret-value",
+            "admin-secret-value",
+        )
+        try:
+            raise RuntimeError("Authorization: Bearer bearer-secret-value")
+        except RuntimeError:
+            logger.exception("Database operation failed")
+        for handler in self.root_logger.handlers:
+            handler.flush()
+        content = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("Client registered", content)
+        self.assertIn("[REDACTED]", content)
+        self.assertNotIn("db-secret-value", content)
+        self.assertNotIn("admin-secret-value", content)
+        self.assertNotIn("bearer-secret-value", content)
+
+    def test_server_registration_heartbeat_logout_and_error_are_logged(self) -> None:
+        log_path = self.log_directory / "server-events.log"
+        server.clients.clear()
+        server.disconnected_clients.clear()
+
+        with patch.dict(
+            os.environ,
+            {"LOG_LEVEL": "DEBUG", "LOG_FILE": str(log_path)},
+            clear=False,
+        ):
+            with patch.object(server, "ensure_ports_available"):
+                with patch.object(server.db_manager, "connect", return_value=True):
+                    with patch.object(
+                        server.db_manager,
+                        "mark_all_clients_offline",
+                        return_value=True,
+                    ):
+                        with patch.object(server.threading, "Thread") as thread:
+                            with patch.object(server.app, "run"):
+                                with patch.object(server, "ADMIN_TOKEN", ""):
+                                    server.start_services()
+                            self.assertEqual(thread.call_count, 2)
+            with patch.object(server.db_manager, "register_client", return_value=True):
+                with patch.object(server.db_manager, "update_heartbeat", return_value=True):
+                    with patch.object(server.db_manager, "update_status", return_value=True):
+                        listener = socket.socket(
+                            socket.AF_INET,
+                            socket.SOCK_STREAM,
+                        )
+                        listener.setsockopt(
+                            socket.SOL_SOCKET,
+                            socket.SO_REUSEADDR,
+                            1,
+                        )
+                        listener.bind(("127.0.0.1", 0))
+                        listener.listen(5)
+                        listener.settimeout(0.1)
+                        stop_listener = threading.Event()
+                        handlers: list[threading.Thread] = []
+
+                        def accept_connections() -> None:
+                            while not stop_listener.is_set():
+                                try:
+                                    connection, address = listener.accept()
+                                except socket.timeout:
+                                    continue
+                                except OSError:
+                                    return
+                                handler = threading.Thread(
+                                    target=server.tcp_client_session,
+                                    args=(connection, address),
+                                )
+                                handlers.append(handler)
+                                handler.start()
+
+                        accept_thread = threading.Thread(
+                            target=accept_connections
+                        )
+                        accept_thread.start()
+                        tcp_peer = tcp_client.TCPClient(
+                            host="127.0.0.1",
+                            port=listener.getsockname()[1],
+                            default_name="logging-node",
+                        )
+                        try:
+                            self.assertEqual(tcp_peer.register()["status"], "ok")
+                            self.assertEqual(
+                                tcp_peer.heartbeat()["raw"],
+                                "OK|HEARTBEAT",
+                            )
+                            self.assertEqual(
+                                tcp_peer.disconnect()["raw"],
+                                "OK|LOGOUT",
+                            )
+                            with socket.create_connection(
+                                listener.getsockname(),
+                                timeout=2,
+                            ) as bad_client:
+                                bad_client.sendall(
+                                    b"SYSTEM|logging-node|CPU=invalid\n"
+                                )
+                                self.assertTrue(
+                                    bad_client.recv(4096).startswith(b"ERROR|")
+                                )
+                        finally:
+                            stop_listener.set()
+                            listener.close()
+                            accept_thread.join(timeout=2)
+                            self.assertFalse(accept_thread.is_alive())
+                            for handler in handlers:
+                                handler.join(timeout=2)
+                                self.assertFalse(handler.is_alive())
+            with patch.object(server, "ADMIN_TOKEN", "admin-token-sentinel"):
+                with server.app.test_client() as http_client:
+                    denied = http_client.post(
+                        "/api/clients/logging-node/commands",
+                        headers={"X-Admin-Token": "invalid-token-sentinel"},
+                        json={"command": "PING"},
+                    )
+                self.assertEqual(denied.status_code, 401)
+        for handler in self.root_logger.handlers:
+            handler.flush()
+        content = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("Starting monitoring services", content)
+        self.assertIn("HTTP dashboard listening", content)
+        self.assertIn("registered from 127.0.0.1", content)
+        self.assertIn("Heartbeat received from client logging-node", content)
+        self.assertIn("Client logging-node logged out", content)
+        self.assertIn("Rejected malformed SYSTEM message", content)
+        self.assertIn("invalid credentials", content)
+        self.assertNotIn("admin-token-sentinel", content)
+        self.assertNotIn("invalid-token-sentinel", content)
+
+    def test_client_lifecycle_events_use_client_log(self) -> None:
+        log_path = self.log_directory / "client-events.log"
+        with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}, clear=False):
+            logging_config.configure_logging("client", log_path)
+        client = monitoring_client.NetworkMonitoringClient(
+            name="client-log-node",
+            host="localhost",
+        )
+        client.tcp_client = Mock()
+        client.tcp_client.register.return_value = {"status": "ok"}
+        client.tcp_client.heartbeat.return_value = {"status": "ok"}
+        client.tcp_client.disconnect.return_value = {"status": "ok"}
+
+        self.assertEqual(client.register()["status"], "ok")
+        self.assertEqual(client.send_heartbeat()["status"], "ok")
+        self.assertEqual(client.disconnect()["status"], "ok")
+        for handler in self.root_logger.handlers:
+            handler.flush()
+        content = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("registered with monitoring server", content)
+        self.assertIn("heartbeat completed", content)
+        self.assertIn("disconnected from monitoring server", content)
 
 
 class ServerDisconnectTests(unittest.TestCase):
@@ -2036,7 +2257,9 @@ class DatabaseStrictStorageTests(unittest.TestCase):
 
 class StartupDatabaseTests(unittest.TestCase):
     def test_server_connects_to_database_before_serving(self) -> None:
-        with patch.object(server, "ensure_ports_available"), patch.object(
+        with patch.object(server, "configure_logging"), patch.object(
+            server, "ensure_ports_available"
+        ), patch.object(
             server.db_manager, "connect", return_value=True
         ) as connect, patch.object(
             server.db_manager, "mark_all_clients_offline", return_value=True
@@ -2051,9 +2274,9 @@ class StartupDatabaseTests(unittest.TestCase):
         run.assert_called_once()
 
     def test_server_refuses_to_start_without_mysql(self) -> None:
-        with patch.object(server, "ensure_ports_available"), patch.object(
-            server.db_manager, "connect", return_value=False
-        ):
+        with patch.object(server, "configure_logging"), patch.object(
+            server, "ensure_ports_available"
+        ), patch.object(server.db_manager, "connect", return_value=False):
             with patch.object(server.threading, "Thread") as thread:
                 with self.assertRaises(SystemExit):
                     server.start_services()
@@ -2191,8 +2414,9 @@ class ClientForcedDisconnectTests(unittest.TestCase):
         }
 
         with patch.object(monitoring_client, "NetworkMonitoringClient", return_value=fake_client):
-            with redirect_stdout(io.StringIO()):
-                monitoring_client.run_cli("node-01", interval=1)
+            with patch.object(monitoring_client, "configure_logging"):
+                with redirect_stdout(io.StringIO()):
+                    monitoring_client.run_cli("node-01", interval=1)
 
         fake_client.send_heartbeat.assert_not_called()
         fake_client.disconnect.assert_not_called()
