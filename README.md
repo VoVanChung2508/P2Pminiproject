@@ -198,12 +198,16 @@ Giao tiếp qua TCP sử dụng chuỗi ký tự UTF-8 phân tách bằng dấu 
 
 | Lệnh | Định dạng gửi từ Client | Phản hồi từ Server | Ý nghĩa |
 | :--- | :--- | :--- | :--- |
-| **REGISTER** | `REGISTER\|<client_name>\|<ip>\|<port>` | `OK\|REGISTERED` | Đăng ký thiết bị mới vào danh sách giám sát |
+| **REGISTER** | `REGISTER\|<client_name>\|<ip>\|<port>` hoặc thêm `\|PROCESS_LIST_V1` | `OK\|REGISTERED` | Đăng ký thiết bị; client mới quảng bá khả năng nhận yêu cầu danh sách tiến trình |
 | **SYSTEM** | `SYSTEM\|<client_name>\|CPU=<cpu>\|RAM=<ram>\|DISK=<disk>\|NETWORK=<net>` | `OK\|SYSTEM` | Cập nhật thông số tài nguyên thời gian thực |
-| **HEARTBEAT**| `HEARTBEAT\|<client_name>` | `OK\|HEARTBEAT` | Duy trì trạng thái sống (tránh bị timeout) |
+| **HEARTBEAT**| `HEARTBEAT\|<client_name>` | `OK\|HEARTBEAT` hoặc `COMMAND\|GET_PROCESS_LIST\|<request_id>\|<limit>` | Duy trì trạng thái sống; nếu có yêu cầu đang chờ, server gửi lệnh cố định trên kết nối này |
 | **LOGOUT** | `LOGOUT\|<client_name>` | `OK\|LOGOUT` | Ngắt kết nối, chuyển trạng thái sang `OFFLINE` |
+| **PROCESS_LIST** | `PROCESS_LIST\|<client_name>\|<request_id>\|<JSON>` | `OK\|PROCESS_LIST` | Client trả tối đa 20 tiến trình với `pid`, `name`, `username`, `cpu_percent`, `memory_percent`, `status` |
+| **PROCESS_LIST_ERROR** | `PROCESS_LIST_ERROR\|<client_name>\|<request_id>\|UNAVAILABLE` | `OK\|PROCESS_LIST` | Client báo không thể thu thập thông tin tiến trình |
 
 ---
+
+Yêu cầu tiến trình chỉ được gửi tới client đã đăng ký và quảng bá `PROCESS_LIST_V1`; lệnh được giao ở heartbeat kế tiếp và hết hạn sau 30 giây. Server chỉ chấp nhận `GET_PROCESS_LIST`, không thực thi shell hay lệnh tùy ý. Request và kết quả được giữ trong bộ nhớ máy chủ, không lưu vào MySQL. Các endpoint yêu cầu tiến trình/kết quả dùng header `X-Admin-Token`; danh tính client hiện tại chỉ dựa trên tên đăng ký, chưa có xác thực mật mã cho client.
 
 ## 🌐 Danh sách REST APIs
 
@@ -214,6 +218,8 @@ Giao tiếp qua TCP sử dụng chuỗi ký tự UTF-8 phân tách bằng dấu 
 | `/api/clients/<name>/history` | GET | Lịch sử các mẫu đo gần nhất của một client cụ thể (lên tới 120 mẫu) |
 | `/api/alerts` | GET | Danh sách các cảnh báo vượt ngưỡng tài nguyên gần nhất |
 | `/api/clients/<name>/disconnect` | POST | Ngắt một client; yêu cầu header `X-Admin-Token: <MONITOR_ADMIN_TOKEN>` |
+| `/api/clients/<name>/process-list` | POST | Yêu cầu client gửi danh sách tối đa 20 tiến trình; cần admin token |
+| `/api/clients/<name>/process-list` | GET | Xem trạng thái/kết quả request tiến trình gần nhất; cần admin token |
 
 Ngắt từ server là ngắt logic: client được lưu trạng thái `OFFLINE` trong MySQL, các lần gửi heartbeat/chỉ số tiếp theo bị từ chối và agent GUI/CLI sẽ dừng. Để kết nối lại, người dùng phải khởi động giám sát lại để gửi lệnh `REGISTER`. `/api/health` trả về `storage` là `mysql` hoặc `unavailable`, cùng trạng thái bật/tắt tính năng ngắt quản trị.
 

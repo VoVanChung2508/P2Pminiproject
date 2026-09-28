@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hmac
+import json
 import logging
+import math
 import socket
 import threading
 import time
+import uuid
 from datetime import datetime
 from os import environ
 from typing import Any
@@ -20,12 +23,20 @@ HEARTBEAT_TIMEOUT = 15
 TCP_CLIENT_TIMEOUT = 30
 SAMPLE_LIMIT = 120
 ADMIN_TOKEN = environ.get("MONITOR_ADMIN_TOKEN", "")
+PROCESS_LIST_CAPABILITY = "PROCESS_LIST_V1"
+PROCESS_LIST_TOP_N = 20
+PROCESS_LIST_REQUEST_TIMEOUT_SECONDS = 30
+PROCESS_LIST_MAX_PAYLOAD_BYTES = 65536
+PROCESS_LIST_MAX_TCP_FRAME_BYTES = PROCESS_LIST_MAX_PAYLOAD_BYTES + 512
+PROCESS_LIST_MAX_TRACKED_CLIENTS = 1000
+PROCESS_LIST_RESULT_RETENTION_SECONDS = 300
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 state_lock = threading.RLock()
 clients: dict[str, dict[str, Any]] = {}
 disconnected_clients: set[str] = set()
+process_requests: dict[str, dict[str, Any]] = {}
 
 db_manager = DatabaseManager()
 
@@ -50,7 +61,11 @@ def parse_metric(value: str, name: str) -> float:
     return round(number, 1)
 
 
-def register_client(name: str, ip: str) -> None:
+def register_client(
+    name: str,
+    ip: str,
+    process_list_capable: bool = False,
+) -> None:
     key = name.lower()
     if not db_manager.register_client(name, ip):
         raise RuntimeError("MySQL did not save the client registration.")
@@ -61,6 +76,7 @@ def register_client(name: str, ip: str) -> None:
             "ip": ip,
             "status": "ONLINE",
             "last_seen_epoch": time.time(),
+            "process_list_capable": process_list_capable,
         }
     log(f"{name} registered from {ip}")
 
@@ -109,6 +125,230 @@ def is_client_disconnected(name: str) -> bool:
         return name.lower() in disconnected_clients
 
 
+def _expire_process_request_locked(client_key: str) -> None:
+    process_request = process_requests.get(client_key)
+    if (
+        process_request
+        and process_request["status"] in {"pending", "delivered"}
+        and time.time() >= process_request["expires_at"]
+    ):
+        process_request["status"] = "timeout"
+        process_request["processes"] = None
+
+
+def _prune_process_requests_locked(now: float) -> None:
+    for client_key, process_request in tuple(process_requests.items()):
+        if (
+            process_request["status"] in {"pending", "delivered"}
+            and now >= process_request["expires_at"]
+        ):
+            process_request["status"] = "timeout"
+            process_request["processes"] = None
+        elif (
+            process_request["status"] not in {"pending", "delivered"}
+            and now
+            >= process_request.get(
+                "completed_at",
+                process_request["requested_at"],
+            )
+            + PROCESS_LIST_RESULT_RETENTION_SECONDS
+        ):
+            del process_requests[client_key]
+
+
+def _queue_process_request(name: str) -> tuple[dict[str, Any] | None, str | None]:
+    key = name.lower()
+    with state_lock:
+        now = time.time()
+        _prune_process_requests_locked(now)
+        client = clients.get(key)
+        if (
+            client is None
+            or client["status"] != "ONLINE"
+            or key in disconnected_clients
+        ):
+            return None, "Client is not registered or is offline."
+        if not client.get("process_list_capable", False):
+            return None, "Client does not support process-list requests."
+        _expire_process_request_locked(key)
+        existing = process_requests.get(key)
+        if existing and existing["status"] in {"pending", "delivered"}:
+            return None, "A process-list request is already pending."
+        if key not in process_requests and len(process_requests) >= PROCESS_LIST_MAX_TRACKED_CLIENTS:
+            return None, "Process-list request capacity is full."
+
+        process_request = {
+            "client": client["name"],
+            "request_id": uuid.uuid4().hex,
+            "status": "pending",
+            "requested_at": now,
+            "expires_at": now + PROCESS_LIST_REQUEST_TIMEOUT_SECONDS,
+            "processes": None,
+        }
+        process_requests[key] = process_request
+        return dict(process_request), None
+
+
+def _next_process_command(
+    name: str,
+    address: tuple[str, int],
+) -> str | None:
+    key = name.lower()
+    with state_lock:
+        client = clients.get(key)
+        process_request = process_requests.get(key)
+        if (
+            client is None
+            or not client.get("process_list_capable", False)
+            or process_request is None
+            or process_request["status"] != "pending"
+        ):
+            return None
+        _expire_process_request_locked(key)
+        if process_request["status"] != "pending":
+            return None
+        process_request["status"] = "delivered"
+        process_request["delivery_address"] = address
+        return (
+            f"COMMAND|GET_PROCESS_LIST|{process_request['request_id']}|"
+            f"{PROCESS_LIST_TOP_N}"
+        )
+
+
+def _validate_process_list(value: Any, limit: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > min(limit, PROCESS_LIST_TOP_N):
+        raise ValueError("Process list must be an array within the requested limit.")
+
+    fields = {
+        "pid",
+        "name",
+        "username",
+        "cpu_percent",
+        "memory_percent",
+        "status",
+    }
+    validated = []
+    seen_pids: set[int] = set()
+    for process in value:
+        if not isinstance(process, dict) or set(process) != fields:
+            raise ValueError("Process record fields are invalid.")
+        pid = process["pid"]
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ValueError("Process ID is invalid.")
+        if pid in seen_pids:
+            raise ValueError("Process ID is duplicated.")
+        seen_pids.add(pid)
+        if (
+            not isinstance(process["name"], str)
+            or not process["name"]
+            or len(process["name"]) > 256
+        ):
+            raise ValueError("Process name is invalid.")
+        for optional_text in ("username", "status"):
+            text = process[optional_text]
+            if text is not None and (
+                not isinstance(text, str) or len(text) > (256 if optional_text == "username" else 64)
+            ):
+                raise ValueError(f"Process {optional_text} is invalid.")
+        for percentage_field in ("cpu_percent", "memory_percent"):
+            percentage = process[percentage_field]
+            if percentage is not None:
+                if isinstance(percentage, bool) or not isinstance(
+                    percentage,
+                    (int, float),
+                ):
+                    raise ValueError(f"Process {percentage_field} is invalid.")
+                try:
+                    numeric_percentage = float(percentage)
+                except OverflowError as error:
+                    raise ValueError(
+                        f"Process {percentage_field} is invalid."
+                    ) from error
+                if (
+                    not math.isfinite(numeric_percentage)
+                    or not 0 <= numeric_percentage <= 100
+                ):
+                    raise ValueError(f"Process {percentage_field} is invalid.")
+        validated.append(dict(process))
+    return validated
+
+
+def _accept_process_list(
+    name: str,
+    request_id: str,
+    payload: str,
+    address: tuple[str, int],
+) -> str:
+    key = name.lower()
+    with state_lock:
+        process_request = process_requests.get(key)
+        if (
+            key not in clients
+            or clients[key]["status"] != "ONLINE"
+            or key in disconnected_clients
+            or not clients[key].get("process_list_capable", False)
+            or process_request is None
+            or process_request["request_id"] != request_id
+            or process_request["status"] != "delivered"
+            or process_request["delivery_address"] != address
+        ):
+            return "ERROR|INVALID_PROCESS_LIST_REQUEST"
+
+        _expire_process_request_locked(key)
+        if process_request["status"] != "delivered":
+            return "ERROR|PROCESS_LIST_TIMEOUT"
+
+    if len(payload.encode("utf-8")) > PROCESS_LIST_MAX_PAYLOAD_BYTES:
+        with state_lock:
+            current = process_requests.get(key)
+            if current and current["request_id"] == request_id:
+                current["status"] = "error"
+                current["processes"] = None
+                current["completed_at"] = time.time()
+        logger.warning(
+            "Rejected oversized process-list reply from registered client %s.",
+            name,
+        )
+        return "ERROR|MALFORMED_PROCESS_LIST"
+
+    try:
+        processes = _validate_process_list(
+            json.loads(payload),
+            PROCESS_LIST_TOP_N,
+        )
+    except (json.JSONDecodeError, RecursionError, ValueError) as error:
+        with state_lock:
+            current = process_requests.get(key)
+            if current and current["request_id"] == request_id:
+                current["status"] = "error"
+                current["processes"] = None
+                current["completed_at"] = time.time()
+        logger.warning(
+            "Rejected malformed process-list reply from registered client %s (%s).",
+            name,
+            type(error).__name__,
+        )
+        return "ERROR|MALFORMED_PROCESS_LIST"
+
+    with state_lock:
+        current = process_requests.get(key)
+        if (
+            current is None
+            or key not in clients
+            or clients[key]["status"] != "ONLINE"
+            or key in disconnected_clients
+            or current["request_id"] != request_id
+            or current["status"] != "delivered"
+            or current["delivery_address"] != address
+        ):
+            return "ERROR|INVALID_PROCESS_LIST_REQUEST"
+        current["status"] = "complete"
+        current["processes"] = processes
+        current["completed_at"] = time.time()
+    logger.info("Received %d process records from client %s.", len(processes), name)
+    return "OK|PROCESS_LIST"
+
+
 def disconnect_client(name: str) -> bool:
     key = name.lower()
     with state_lock:
@@ -139,6 +379,50 @@ def mark_offline_clients() -> None:
 
 
 def handle_message(message: str, address: tuple[str, int]) -> str:
+    process_parts = message.strip().split("|", 3)
+    process_command = process_parts[0].upper()
+    if process_command == "PROCESS_LIST":
+        if len(process_parts) != 4:
+            return "ERROR|MALFORMED_PROCESS_LIST"
+        return _accept_process_list(
+            process_parts[1],
+            process_parts[2],
+            process_parts[3],
+            address,
+        )
+    if process_command == "PROCESS_LIST_ERROR":
+        if len(process_parts) != 4:
+            return "ERROR|MALFORMED_PROCESS_LIST"
+        name, request_id, error_code = process_parts[1:]
+        if error_code not in {"UNAVAILABLE", "FAILED"}:
+            return "ERROR|MALFORMED_PROCESS_LIST"
+        key = name.lower()
+        with state_lock:
+            process_request = process_requests.get(key)
+            if (
+                key not in clients
+                or clients[key]["status"] != "ONLINE"
+                or key in disconnected_clients
+                or not clients[key].get("process_list_capable", False)
+                or process_request is None
+                or process_request["request_id"] != request_id
+                or process_request["status"] != "delivered"
+                or process_request["delivery_address"] != address
+            ):
+                return "ERROR|INVALID_PROCESS_LIST_REQUEST"
+            _expire_process_request_locked(key)
+            if process_request["status"] != "delivered":
+                return "ERROR|PROCESS_LIST_TIMEOUT"
+            process_request["status"] = "error"
+            process_request["processes"] = None
+            process_request["completed_at"] = time.time()
+        logger.warning(
+            "Client %s could not provide its requested process list (%s).",
+            name,
+            error_code,
+        )
+        return "OK|PROCESS_LIST"
+
     parts = [part.strip() for part in message.strip().split("|")]
     if not parts:
         return "ERROR|Empty message"
@@ -147,7 +431,11 @@ def handle_message(message: str, address: tuple[str, int]) -> str:
         if command == "REGISTER" and len(parts) >= 2:
             if not parts[1]:
                 return "ERROR|Client name is required"
-            register_client(parts[1], address[0])
+            register_client(
+                parts[1],
+                address[0],
+                PROCESS_LIST_CAPABILITY in parts[2:],
+            )
             return "OK|REGISTERED"
         if len(parts) >= 2 and is_client_disconnected(parts[1]):
             return "ERROR|DISCONNECTED"
@@ -155,6 +443,9 @@ def handle_message(message: str, address: tuple[str, int]) -> str:
             if not touch_client(parts[1]):
                 reason = "DISCONNECTED" if is_client_disconnected(parts[1]) else "NOT_REGISTERED"
                 return f"ERROR|{reason}"
+            process_command = _next_process_command(parts[1], address)
+            if process_command is not None:
+                return process_command
             return "OK|HEARTBEAT"
         if command == "SYSTEM" and len(parts) >= 2:
             metrics: dict[str, float] = {}
@@ -225,6 +516,13 @@ def tcp_client_session(connection: socket.socket, address: tuple[str, int]) -> N
             buffer += data.decode("utf-8", errors="replace")
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
+                if len(line.encode("utf-8")) > PROCESS_LIST_MAX_TCP_FRAME_BYTES:
+                    logger.warning(
+                        "Rejected oversized TCP message from %s:%s.",
+                        address[0],
+                        address[1],
+                    )
+                    return
                 if line.strip():
                     response = handle_message(line, address)
                     try:
@@ -250,6 +548,13 @@ def tcp_client_session(connection: socket.socket, address: tuple[str, int]) -> N
                             address[1],
                         )
                         return
+            if len(buffer.encode("utf-8")) > PROCESS_LIST_MAX_TCP_FRAME_BYTES:
+                logger.warning(
+                    "TCP message exceeded maximum size from %s:%s.",
+                    address[0],
+                    address[1],
+                )
+                return
     except OSError:
         logger.exception(
             "TCP client session failed for client at %s:%s.",
@@ -396,13 +701,75 @@ def api_alerts():
     return jsonify({"alerts": stored_alerts})
 
 
-@app.post("/api/clients/<name>/disconnect")
-def api_disconnect_client(name: str):
+def _admin_token_error() -> tuple[str, int] | None:
     if not ADMIN_TOKEN:
-        return jsonify({"status": "error", "message": "Server admin token is not configured"}), 503
+        return "Server admin token is not configured", 503
     supplied_token = request.headers.get("X-Admin-Token", "")
     if not hmac.compare_digest(supplied_token, ADMIN_TOKEN):
-        return jsonify({"status": "error", "message": "Invalid admin token"}), 401
+        return "Invalid admin token", 401
+    return None
+
+
+@app.route("/api/clients/<name>/process-list", methods=["GET", "POST"])
+def api_process_list(name: str):
+    auth_error = _admin_token_error()
+    if auth_error is not None:
+        message, status_code = auth_error
+        return jsonify({"status": "error", "message": message}), status_code
+
+    key = name.lower()
+    if request.method == "POST":
+        process_request, error = _queue_process_request(name)
+        if error is not None:
+            with state_lock:
+                client = clients.get(key)
+                if client is None:
+                    error_code = "CLIENT_NOT_FOUND"
+                elif (
+                    client["status"] != "ONLINE"
+                    or key in disconnected_clients
+                ):
+                    error_code = "CLIENT_OFFLINE"
+                elif not client.get("process_list_capable", False):
+                    error_code = "PROCESS_LIST_UNSUPPORTED"
+                else:
+                    error_code = "PROCESS_LIST_PENDING"
+            status_code = (
+                404
+                if error_code == "CLIENT_NOT_FOUND"
+                else 503
+                if error_code == "PROCESS_LIST_CAPACITY"
+                else 409
+            )
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": error,
+                    "code": error_code,
+                }
+            ), status_code
+        logger.info("Queued process-list request for registered client %s.", name)
+        return jsonify({"status": "ok", "request": process_request}), 202
+
+    with state_lock:
+        _expire_process_request_locked(key)
+        _prune_process_requests_locked(time.time())
+        process_request = process_requests.get(key)
+        if process_request is None:
+            return jsonify(
+                {"status": "error", "message": "No process-list request found."}
+            ), 404
+        result = dict(process_request)
+        result.pop("expires_at", None)
+    return jsonify({"status": "ok", "request": result})
+
+
+@app.post("/api/clients/<name>/disconnect")
+def api_disconnect_client(name: str):
+    auth_error = _admin_token_error()
+    if auth_error is not None:
+        message, status_code = auth_error
+        return jsonify({"status": "error", "message": message}), status_code
     if not disconnect_client(name):
         return jsonify({"status": "error", "message": "Client not found"}), 404
     return jsonify({"status": "ok", "message": f"Client {name} disconnected"})

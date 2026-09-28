@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import io
+import json
 import os
 import socket
 import threading
@@ -12,7 +14,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
-from client import monitoring_client
+from client import monitoring_client, process_monitor, tcp_client
 from common import database
 from server import server
 from server import server_gui
@@ -257,6 +259,20 @@ class TCPClientSessionTests(unittest.TestCase):
         connection.close.assert_called_once_with()
         self.assertTrue(any("TCP receive failed" in entry for entry in captured.output))
 
+    def test_oversized_incomplete_tcp_frame_is_logged_and_connection_closed(self) -> None:
+        connection = Mock()
+        connection.recv.return_value = b"x" * (
+            server.PROCESS_LIST_MAX_TCP_FRAME_BYTES + 1
+        )
+
+        with self.assertLogs(server.logger, level="WARNING") as captured:
+            server.tcp_client_session(connection, ("127.0.0.1", 12351))
+
+        connection.close.assert_called_once_with()
+        self.assertTrue(
+            any("exceeded maximum size" in entry for entry in captured.output)
+        )
+
     def test_unexpected_send_error_is_logged_and_connection_is_closed(self) -> None:
         connection = Mock()
         connection.recv.return_value = b"REGISTER|node-04\n"
@@ -420,6 +436,524 @@ class TCPClientSessionTests(unittest.TestCase):
 
         listener.__exit__.assert_called_once()
         self.assertTrue(any("TCP accept failed" in entry for entry in captured.output))
+
+
+class ProcessMonitoringTests(unittest.TestCase):
+    SAMPLE_PROCESS = {
+        "pid": 123,
+        "name": "worker",
+        "username": "monitor",
+        "cpu_percent": 12.5,
+        "memory_percent": 3.25,
+        "status": "running",
+    }
+    SECOND_PROCESS = {
+        "pid": 456,
+        "name": "worker-helper",
+        "username": None,
+        "cpu_percent": 2.0,
+        "memory_percent": 1.0,
+        "status": "sleeping",
+    }
+
+    def setUp(self) -> None:
+        self.previous_admin_token = server.ADMIN_TOKEN
+        self.previous_clients = copy.deepcopy(server.clients)
+        self.previous_disconnected = set(server.disconnected_clients)
+        self.previous_process_requests = copy.deepcopy(server.process_requests)
+        server.ADMIN_TOKEN = "test-process-admin-token"
+        server.clients.clear()
+        server.disconnected_clients.clear()
+        server.process_requests.clear()
+
+        self.database_patches = (
+            patch.object(server.db_manager, "register_client", return_value=True),
+            patch.object(server.db_manager, "update_heartbeat", return_value=True),
+            patch.object(server.db_manager, "update_status", return_value=True),
+        )
+        for active_patch in self.database_patches:
+            active_patch.start()
+            self.addCleanup(active_patch.stop)
+        self.client = server.app.test_client()
+
+    def tearDown(self) -> None:
+        server.ADMIN_TOKEN = self.previous_admin_token
+        server.clients.clear()
+        server.clients.update(self.previous_clients)
+        server.disconnected_clients.clear()
+        server.disconnected_clients.update(self.previous_disconnected)
+        server.process_requests.clear()
+        server.process_requests.update(self.previous_process_requests)
+
+    def register(self, name: str, *, capable: bool = True) -> None:
+        capability = f"|{server.PROCESS_LIST_CAPABILITY}" if capable else ""
+        response = server.handle_message(
+            f"REGISTER|{name}|127.0.0.1|8888{capability}",
+            ("127.0.0.1", 30000),
+        )
+        self.assertEqual(response, "OK|REGISTERED")
+
+    def admin_headers(self) -> dict[str, str]:
+        return {"X-Admin-Token": server.ADMIN_TOKEN}
+
+    def request_process_list(self, name: str):
+        return self.client.post(
+            f"/api/clients/{name}/process-list",
+            headers=self.admin_headers(),
+        )
+
+    def test_admin_request_is_delivered_and_structured_result_is_retrieved(self) -> None:
+        name = "process-node"
+        self.register(name)
+
+        queued = self.request_process_list(name)
+        self.assertEqual(queued.status_code, 202)
+        request_id = queued.get_json()["request"]["request_id"]
+
+        command = server.handle_message(
+            f"HEARTBEAT|{name}",
+            ("127.0.0.1", 30000),
+        )
+        self.assertEqual(
+            command,
+            f"COMMAND|GET_PROCESS_LIST|{request_id}|{server.PROCESS_LIST_TOP_N}",
+        )
+        reply = server.handle_message(
+            f"PROCESS_LIST|{name}|{request_id}|"
+            + json.dumps([self.SAMPLE_PROCESS, self.SECOND_PROCESS]),
+            ("127.0.0.1", 30000),
+        )
+        self.assertEqual(reply, "OK|PROCESS_LIST")
+
+        result = self.client.get(
+            f"/api/clients/{name}/process-list",
+            headers=self.admin_headers(),
+        )
+        request_data = result.get_json()["request"]
+        self.assertEqual(request_data["status"], "complete")
+        self.assertEqual(
+            request_data["processes"],
+            [self.SAMPLE_PROCESS, self.SECOND_PROCESS],
+        )
+
+    def test_request_and_result_routes_require_admin_token(self) -> None:
+        self.register("process-node")
+
+        response = self.client.post("/api/clients/process-node/process-list")
+        self.assertEqual(response.status_code, 401)
+        response = self.client.get(
+            "/api/clients/process-node/process-list",
+            headers={"X-Admin-Token": "incorrect"},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_legacy_client_does_not_receive_process_commands(self) -> None:
+        self.register("legacy-node", capable=False)
+
+        response = self.request_process_list("legacy-node")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            server.handle_message(
+                "HEARTBEAT|legacy-node",
+                ("127.0.0.1", 30000),
+            ),
+            "OK|HEARTBEAT",
+        )
+
+    def test_unregistered_client_cannot_be_requested(self) -> None:
+        response = self.request_process_list("unknown-node")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(server.process_requests, {})
+
+    def test_malformed_process_reply_is_rejected_and_reported(self) -> None:
+        name = "malformed-node"
+        self.register(name)
+        request_id = self.request_process_list(name).get_json()["request"]["request_id"]
+        server.handle_message(f"HEARTBEAT|{name}", ("127.0.0.1", 30000))
+
+        response = server.handle_message(
+            f"PROCESS_LIST|{name}|{request_id}|"
+            + json.dumps([{"pid": 1, "name": "incomplete"}]),
+            ("127.0.0.1", 30000),
+        )
+        self.assertEqual(response, "ERROR|MALFORMED_PROCESS_LIST")
+        self.assertEqual(server.process_requests[name]["status"], "error")
+
+    def test_process_reply_from_different_tcp_peer_is_rejected(self) -> None:
+        name = "spoofed-node"
+        self.register(name)
+        request_id = self.request_process_list(name).get_json()["request"]["request_id"]
+        server.handle_message(
+            f"HEARTBEAT|{name}",
+            ("127.0.0.1", 30000),
+        )
+
+        response = server.handle_message(
+            f"PROCESS_LIST|{name}|{request_id}|{json.dumps([self.SAMPLE_PROCESS])}",
+            ("127.0.0.1", 30001),
+        )
+
+        self.assertEqual(response, "ERROR|INVALID_PROCESS_LIST_REQUEST")
+        self.assertEqual(server.process_requests[name]["status"], "delivered")
+
+    def test_process_reply_is_capped_and_payload_size_is_bounded(self) -> None:
+        name = "oversized-node"
+        self.register(name)
+        request_id = self.request_process_list(name).get_json()["request"]["request_id"]
+        server.handle_message(f"HEARTBEAT|{name}", ("127.0.0.1", 30000))
+        too_many = [
+            {**self.SAMPLE_PROCESS, "pid": index + 1}
+            for index in range(server.PROCESS_LIST_TOP_N + 1)
+        ]
+
+        response = server.handle_message(
+            f"PROCESS_LIST|{name}|{request_id}|{json.dumps(too_many)}",
+            ("127.0.0.1", 30000),
+        )
+        self.assertEqual(response, "ERROR|MALFORMED_PROCESS_LIST")
+
+        request_id = self.request_process_list(name).get_json()["request"]["request_id"]
+        server.handle_message(f"HEARTBEAT|{name}", ("127.0.0.1", 30000))
+        oversized_payload = json.dumps(
+            [{**self.SAMPLE_PROCESS, "name": "x" * server.PROCESS_LIST_MAX_PAYLOAD_BYTES}]
+        )
+        response = server.handle_message(
+            f"PROCESS_LIST|{name}|{request_id}|{oversized_payload}",
+            ("127.0.0.1", 30000),
+        )
+        self.assertEqual(response, "ERROR|MALFORMED_PROCESS_LIST")
+
+    def test_client_unavailable_process_data_is_reported_to_server(self) -> None:
+        name = "unavailable-node"
+        self.register(name)
+        request_id = self.request_process_list(name).get_json()["request"]["request_id"]
+        server.handle_message(f"HEARTBEAT|{name}", ("127.0.0.1", 30000))
+
+        response = server.handle_message(
+            f"PROCESS_LIST_ERROR|{name}|{request_id}|UNAVAILABLE",
+            ("127.0.0.1", 30000),
+        )
+        self.assertEqual(response, "OK|PROCESS_LIST")
+        self.assertEqual(server.process_requests[name]["status"], "error")
+
+    def test_expired_request_is_not_delivered(self) -> None:
+        name = "expired-node"
+        self.register(name)
+        queued = self.request_process_list(name)
+        self.assertEqual(queued.status_code, 202)
+        request_id = queued.get_json()["request"]["request_id"]
+        expiry = server.process_requests[name]["expires_at"]
+
+        with patch("server.server.time.time", return_value=expiry + 1):
+            response = server.handle_message(
+                f"HEARTBEAT|{name}",
+                ("127.0.0.1", 30000),
+            )
+        self.assertEqual(response, "OK|HEARTBEAT")
+        self.assertEqual(server.process_requests[name]["status"], "timeout")
+        self.assertNotIn(request_id, response)
+
+    def test_client_answers_only_allowlisted_process_list_command(self) -> None:
+        fake_socket = Mock()
+        fake_socket.__enter__ = Mock(return_value=fake_socket)
+        fake_socket.__exit__ = Mock(return_value=None)
+        fake_socket.recv.side_effect = [
+            b"COMMAND|GET_PROCESS_LIST|abc123|20\n",
+            b"OK|PROCESS_LIST\n",
+        ]
+        with patch.object(
+            tcp_client.socket, "create_connection", return_value=fake_socket
+        ):
+            with patch.object(
+                tcp_client,
+                "collect_process_list",
+                return_value=[self.SAMPLE_PROCESS],
+            ) as collect:
+                result = tcp_client.TCPClient(
+                    host="127.0.0.1",
+                    port=8888,
+                    default_name="process-node",
+                ).heartbeat()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["raw"], "OK|HEARTBEAT")
+        self.assertEqual(result["process_list_status"], "complete")
+        collect.assert_called_once_with(20)
+        sent_lines = [
+            call.args[0].decode("utf-8").strip()
+            for call in fake_socket.sendall.call_args_list
+        ]
+        self.assertEqual(sent_lines[0], "HEARTBEAT|process-node")
+        self.assertTrue(sent_lines[1].startswith("PROCESS_LIST|process-node|abc123|"))
+        self.assertEqual(json.loads(sent_lines[1].split("|", 3)[3]), [self.SAMPLE_PROCESS])
+
+    def test_client_registration_advertises_fixed_process_capability(self) -> None:
+        message = tcp_client.TCPClient(default_name="process-node")._build_message(
+            "REGISTER",
+            {
+                "name": "process-node",
+                "host": "127.0.0.1",
+                "port": 8888,
+            },
+        )
+
+        self.assertEqual(
+            message,
+            "REGISTER|process-node|127.0.0.1|8888|PROCESS_LIST_V1",
+        )
+        self.assertEqual(
+            server.handle_message(message, ("127.0.0.1", 30000)),
+            "OK|REGISTERED",
+        )
+        self.assertTrue(server.clients["process-node"]["process_list_capable"])
+
+    def test_raw_socket_registration_fallback_advertises_capability(self) -> None:
+        fake_socket = Mock()
+        fake_socket.__enter__ = Mock(return_value=fake_socket)
+        fake_socket.__exit__ = Mock(return_value=None)
+        fake_socket.recv.return_value = b"OK|REGISTERED\n"
+        with patch.object(monitoring_client, "TCPClient", None):
+            with patch.object(monitoring_client, "HTTPClient", None):
+                with patch.object(
+                    monitoring_client.socket,
+                    "create_connection",
+                    return_value=fake_socket,
+                ):
+                    client = monitoring_client.NetworkMonitoringClient(
+                        name="fallback-node"
+                    )
+                    result = client.register()
+
+        self.assertEqual(result["status"], "ok")
+        fake_socket.sendall.assert_called_once_with(
+            b"REGISTER|fallback-node|127.0.0.1|8888|PROCESS_LIST_V1\n"
+        )
+
+    def test_process_request_completes_over_real_loopback_tcp_exchange(self) -> None:
+        stop_listener = threading.Event()
+        handler_threads: list[threading.Thread] = []
+        listener_errors: list[OSError] = []
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(5)
+        listener.settimeout(0.1)
+        tcp_port = listener.getsockname()[1]
+
+        def accept_connections() -> None:
+            while not stop_listener.is_set():
+                try:
+                    connection, address = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError as error:
+                    if not stop_listener.is_set():
+                        listener_errors.append(error)
+                    return
+                handler = threading.Thread(
+                    target=server.tcp_client_session,
+                    args=(connection, address),
+                )
+                handler_threads.append(handler)
+                handler.start()
+
+        accept_thread = threading.Thread(target=accept_connections)
+        accept_thread.start()
+        name = "loopback-process-node"
+        tcp_peer = tcp_client.TCPClient(
+            host="127.0.0.1",
+            port=tcp_port,
+            default_name=name,
+        )
+        try:
+            self.assertEqual(tcp_peer.register()["status"], "ok")
+            ordinary_heartbeat = tcp_peer.heartbeat()
+            self.assertEqual(ordinary_heartbeat["raw"], "OK|HEARTBEAT")
+            self.assertNotIn("process_list_status", ordinary_heartbeat)
+            queued = self.request_process_list(name)
+            self.assertEqual(queued.status_code, 202)
+
+            with patch.object(
+                tcp_client,
+                "collect_process_list",
+                return_value=[self.SAMPLE_PROCESS, self.SECOND_PROCESS],
+            ):
+                heartbeat = tcp_peer.heartbeat()
+            self.assertEqual(heartbeat["status"], "ok")
+            self.assertEqual(heartbeat["process_list_status"], "complete")
+
+            result = self.client.get(
+                f"/api/clients/{name}/process-list",
+                headers=self.admin_headers(),
+            )
+            self.assertEqual(result.get_json()["request"]["status"], "complete")
+            self.assertEqual(
+                result.get_json()["request"]["processes"],
+                [self.SAMPLE_PROCESS, self.SECOND_PROCESS],
+            )
+        finally:
+            stop_listener.set()
+            listener.close()
+            accept_thread.join(timeout=2)
+            self.assertFalse(accept_thread.is_alive())
+            for handler in handler_threads:
+                handler.join(timeout=2)
+                self.assertFalse(handler.is_alive())
+            self.assertEqual(listener_errors, [])
+
+    def test_client_does_not_execute_arbitrary_server_command(self) -> None:
+        fake_socket = Mock()
+        fake_socket.__enter__ = Mock(return_value=fake_socket)
+        fake_socket.__exit__ = Mock(return_value=None)
+        fake_socket.recv.return_value = b"COMMAND|RUN_SHELL|abc123|whoami\n"
+
+        with patch.object(
+            tcp_client.socket, "create_connection", return_value=fake_socket
+        ):
+            with patch.object(tcp_client, "collect_process_list") as collect:
+                result = tcp_client.TCPClient(default_name="process-node").heartbeat()
+
+        self.assertEqual(result["status"], "error")
+        collect.assert_not_called()
+        fake_socket.sendall.assert_called_once_with(b"HEARTBEAT|process-node\n")
+
+    def test_client_rejects_malformed_process_list_command(self) -> None:
+        fake_socket = Mock()
+        fake_socket.__enter__ = Mock(return_value=fake_socket)
+        fake_socket.__exit__ = Mock(return_value=None)
+        fake_socket.recv.return_value = b"COMMAND|GET_PROCESS_LIST|abc123|999\n"
+
+        with patch.object(
+            tcp_client.socket, "create_connection", return_value=fake_socket
+        ):
+            with patch.object(tcp_client, "collect_process_list") as collect:
+                result = tcp_client.TCPClient(default_name="process-node").heartbeat()
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["message"], "Unsupported server command")
+        collect.assert_not_called()
+        fake_socket.sendall.assert_called_once_with(b"HEARTBEAT|process-node\n")
+
+    def test_client_handles_server_timeout_and_disconnect_during_collection(self) -> None:
+        timed_out_socket = Mock()
+        timed_out_socket.__enter__ = Mock(return_value=timed_out_socket)
+        timed_out_socket.__exit__ = Mock(return_value=None)
+        timed_out_socket.recv.side_effect = socket.timeout("timed out")
+        with patch.object(
+            tcp_client.socket, "create_connection", return_value=timed_out_socket
+        ):
+            timeout_result = tcp_client.TCPClient(default_name="node").heartbeat()
+        self.assertEqual(timeout_result["status"], "error")
+
+        disconnected_socket = Mock()
+        disconnected_socket.__enter__ = Mock(return_value=disconnected_socket)
+        disconnected_socket.__exit__ = Mock(return_value=None)
+        disconnected_socket.recv.side_effect = [
+            b"COMMAND|GET_PROCESS_LIST|abc123|20\n",
+            b"",
+        ]
+        with patch.object(
+            tcp_client.socket,
+            "create_connection",
+            return_value=disconnected_socket,
+        ):
+            with patch.object(
+                tcp_client,
+                "collect_process_list",
+                return_value=[self.SAMPLE_PROCESS],
+            ):
+                disconnect_result = tcp_client.TCPClient(
+                    default_name="process-node"
+                ).heartbeat()
+        self.assertEqual(disconnect_result["status"], "error")
+        self.assertEqual(
+            disconnect_result["message"],
+            "No acknowledgement for process-list response",
+        )
+
+    def test_unknown_inbound_command_is_rejected(self) -> None:
+        response = server.handle_message(
+            "RUN_SHELL|whoami",
+            ("127.0.0.1", 30000),
+        )
+
+        self.assertEqual(response, "ERROR|Unsupported message")
+
+
+class ProcessCollectorTests(unittest.TestCase):
+    def test_process_collector_caps_and_handles_disappeared_or_denied_processes(self) -> None:
+        class FakeError(Exception):
+            pass
+
+        class FakeNoSuchProcess(FakeError):
+            pass
+
+        class FakeZombieProcess(FakeNoSuchProcess):
+            pass
+
+        class FakeAccessDenied(FakeError):
+            pass
+
+        class FakePsutil:
+            Error = FakeError
+            NoSuchProcess = FakeNoSuchProcess
+            ZombieProcess = FakeZombieProcess
+            AccessDenied = FakeAccessDenied
+
+            class Process:
+                def __init__(self, info=None, error=None):
+                    self._info = info
+                    self._error = error
+
+                @property
+                def info(self):
+                    if self._error:
+                        raise self._error
+                    return self._info
+
+            @staticmethod
+            def process_iter(*, attrs, ad_value):
+                self.assertIn("pid", attrs)
+                self.assertIsNone(ad_value)
+                processes = [
+                    FakePsutil.Process(
+                        info={
+                            "pid": index + 1,
+                            "name": f"process-{index}",
+                            "username": None,
+                            "cpu_percent": float(index % 101),
+                            "memory_percent": float(index % 101),
+                            "status": "running",
+                        }
+                    )
+                    for index in range(25)
+                ]
+                denied = FakePsutil.Process(error=FakeAccessDenied())
+                missing = FakePsutil.Process(error=FakeNoSuchProcess())
+                return [*processes, denied, missing]
+
+        with patch.object(process_monitor, "psutil", FakePsutil):
+            result = process_monitor.collect_process_list()
+
+        self.assertEqual(len(result), process_monitor.TOP_N)
+        self.assertTrue(
+            all(set(process) == process_monitor.PROCESS_FIELDS for process in result)
+        )
+        self.assertEqual(
+            [process["memory_percent"] for process in result],
+            sorted(
+                (process["memory_percent"] for process in result),
+                reverse=True,
+            ),
+        )
+
+    def test_process_collector_rejects_unbounded_or_unavailable_requests(self) -> None:
+        with self.assertRaises(ValueError):
+            process_monitor.collect_process_list(process_monitor.TOP_N + 1)
+        with patch.object(process_monitor, "psutil", None):
+            with self.assertRaises(RuntimeError):
+                process_monitor.collect_process_list()
 
 
 @unittest.skipUnless(

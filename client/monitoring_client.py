@@ -165,6 +165,8 @@ class NetworkMonitoringClient:
         """Fallback raw socket sender if tcp_client is unavailable."""
         try:
             with socket.create_connection((self.host, self.tcp_port), timeout=5) as sock:
+                if message.startswith("REGISTER|"):
+                    message += "|PROCESS_LIST_V1"
                 sock.sendall((message + "\n").encode("utf-8"))
                 data = sock.recv(4096)
                 if not data:
