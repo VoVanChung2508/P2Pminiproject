@@ -6,6 +6,8 @@ import socket
 import threading
 import tempfile
 import unittest
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -14,6 +16,29 @@ from client import monitoring_client
 from common import database
 from server import server
 from server import server_gui
+
+
+def open_tcp_session() -> tuple[socket.socket, socket.socket, threading.Thread]:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_socket.settimeout(2)
+        client_socket.connect(listener.getsockname())
+        accepted_socket, address = listener.accept()
+
+    handler = threading.Thread(
+        target=server.tcp_client_session,
+        args=(accepted_socket, address),
+    )
+    handler.start()
+    return accepted_socket, client_socket, handler
+
+
+def exchange_tcp_message(client_socket: socket.socket, message: str) -> str:
+    client_socket.sendall((message + "\n").encode("utf-8"))
+    return client_socket.recv(4096).decode("utf-8").strip()
 
 
 class ServerDisconnectTests(unittest.TestCase):
@@ -133,20 +158,12 @@ class TCPClientSessionTests(unittest.TestCase):
         server.disconnected_clients.update(self.previous_disconnected)
 
     def open_session(
-        self, client_port: int = 12345
+        self,
     ) -> tuple[socket.socket, socket.socket, threading.Thread]:
-        accepted_socket, client_socket = socket.socketpair()
-        client_socket.settimeout(2)
-        handler = threading.Thread(
-            target=server.tcp_client_session,
-            args=(accepted_socket, ("127.0.0.1", client_port)),
-        )
-        handler.start()
-        return accepted_socket, client_socket, handler
+        return open_tcp_session()
 
     def exchange(self, client_socket: socket.socket, message: str) -> str:
-        client_socket.sendall((message + "\n").encode("utf-8"))
-        return client_socket.recv(4096).decode("utf-8").strip()
+        return exchange_tcp_message(client_socket, message)
 
     def test_register_heartbeat_and_logout_use_existing_protocol(self) -> None:
         accepted_socket, client_socket, handler = self.open_session()
@@ -252,7 +269,7 @@ class TCPClientSessionTests(unittest.TestCase):
         self.assertTrue(any("TCP send failed" in entry for entry in captured.output))
 
     def test_multiple_clients_connect_concurrently(self) -> None:
-        sessions = [self.open_session(12400 + index) for index in range(4)]
+        sessions = [self.open_session() for _ in range(4)]
         try:
             senders = [
                 threading.Thread(
@@ -286,6 +303,111 @@ class TCPClientSessionTests(unittest.TestCase):
             for _, _, handler in sessions:
                 handler.join(timeout=2)
 
+    def test_concurrent_clients_keep_protocol_state_isolated(self) -> None:
+        for count in (2, 5, 10):
+            prefix = f"multi-{count}-{uuid.uuid4().hex[:8]}"
+            names = [f"{prefix}-{index}" for index in range(count)]
+            metrics = [
+                {
+                    "cpu": float(10 + index),
+                    "ram": float(20 + index),
+                    "disk": float(30 + index),
+                    "network": float(40 + index),
+                }
+                for index in range(count)
+            ]
+            sessions = [self.open_session() for _ in names]
+            try:
+                def broadcast(message_for_index: Any) -> list[str]:
+                    with ThreadPoolExecutor(max_workers=count) as executor:
+                        futures = [
+                            executor.submit(
+                                self.exchange,
+                                client_socket,
+                                message_for_index(index),
+                            )
+                            for index, (_, client_socket, _) in enumerate(sessions)
+                        ]
+                        return [future.result(timeout=10) for future in futures]
+
+                register_responses = broadcast(
+                    lambda index: f"REGISTER|{names[index]}|127.0.0.1|8888"
+                )
+                self.assertEqual(register_responses, ["OK|REGISTERED"] * count)
+
+                system_responses = broadcast(
+                    lambda index: "SYSTEM|{}|CPU={}|RAM={}|DISK={}|NETWORK={}".format(
+                        names[index],
+                        metrics[index]["cpu"],
+                        metrics[index]["ram"],
+                        metrics[index]["disk"],
+                        metrics[index]["network"],
+                    )
+                )
+                self.assertEqual(system_responses, ["OK|SYSTEM"] * count)
+
+                heartbeat_responses = broadcast(
+                    lambda index: f"HEARTBEAT|{names[index]}"
+                )
+                self.assertEqual(heartbeat_responses, ["OK|HEARTBEAT"] * count)
+
+                runtime_clients = {
+                    key: server.clients[key.lower()] for key in names
+                }
+                self.assertEqual(len(runtime_clients), count)
+                for client in runtime_clients.values():
+                    self.assertEqual(client["status"], "ONLINE")
+                    self.assertIsInstance(client["last_seen_epoch"], float)
+                    self.assertGreater(client["last_seen_epoch"], 0)
+
+                metric_calls = {
+                    call.args[0]: call.args[1]
+                    for call in server.db_manager.update_metrics.call_args_list
+                    if call.args[0] in names
+                }
+                self.assertEqual(
+                    {name: metric_calls[name] for name in names},
+                    {name: metrics[index] for index, name in enumerate(names)},
+                )
+                self.assertCountEqual(
+                    [
+                        call.args[0]
+                        for call in server.db_manager.register_client.call_args_list
+                        if call.args[0] in names
+                    ],
+                    names,
+                )
+                self.assertCountEqual(
+                    [
+                        call.args[0]
+                        for call in server.db_manager.update_heartbeat.call_args_list
+                        if call.args[0] in names
+                    ],
+                    names,
+                )
+
+                self.assertEqual(
+                    self.exchange(sessions[0][1], f"LOGOUT|{names[0]}"),
+                    "OK|LOGOUT",
+                )
+                self.assertEqual(server.clients[names[0]]["status"], "OFFLINE")
+                for name in names[1:]:
+                    self.assertEqual(server.clients[name]["status"], "ONLINE")
+
+                if count > 1:
+                    sessions[1][1].close()
+                    sessions[1][2].join(timeout=2)
+                    self.assertFalse(sessions[1][2].is_alive())
+                    self.assertEqual(server.clients[names[1]]["status"], "ONLINE")
+                    for name in names[2:]:
+                        self.assertEqual(server.clients[name]["status"], "ONLINE")
+            finally:
+                for _, client_socket, _ in sessions:
+                    client_socket.close()
+                for _, _, handler in sessions:
+                    handler.join(timeout=2)
+                    self.assertFalse(handler.is_alive())
+
     def test_accept_error_is_logged_and_stops_listener_loop(self) -> None:
         listener = MagicMock()
         listener.__enter__.return_value = listener
@@ -298,6 +420,169 @@ class TCPClientSessionTests(unittest.TestCase):
 
         listener.__exit__.assert_called_once()
         self.assertTrue(any("TCP accept failed" in entry for entry in captured.output))
+
+
+@unittest.skipUnless(
+    os.environ.get("MYSQL_INTEGRATION_TEST") == "1"
+    and os.environ.get("MYSQL_INTEGRATION_TEST_DB"),
+    "Set MYSQL_INTEGRATION_TEST=1 and MYSQL_INTEGRATION_TEST_DB to enable "
+    "multi-client MySQL integration coverage.",
+)
+class MySQLMultiClientIntegrationTests(unittest.TestCase):
+    def test_concurrent_tcp_clients_persist_independent_records(self) -> None:
+        if not database.MYSQL_AVAILABLE:
+            self.skipTest("mysql-connector-python is unavailable.")
+
+        manager = database.DatabaseManager(
+            database=os.environ["MYSQL_INTEGRATION_TEST_DB"],
+            create_database=False,
+        )
+        if not manager.connect():
+            manager.close()
+            self.skipTest("Configured MySQL integration database is unavailable.")
+
+        previous_clients = {
+            key: dict(value) for key, value in server.clients.items()
+        }
+        previous_disconnected = set(server.disconnected_clients)
+        server.clients.clear()
+        server.disconnected_clients.clear()
+
+        run_id = uuid.uuid4().hex
+        test_names: list[str] = []
+        sessions: list[
+            tuple[socket.socket, socket.socket, threading.Thread]
+        ] = []
+        try:
+            with patch.object(server, "db_manager", manager):
+                for count in (2, 5, 10):
+                    names = [
+                        f"mysql-multi-{run_id}-{count}-{index}"
+                        for index in range(count)
+                    ]
+                    test_names.extend(name.lower() for name in names)
+                    metrics = [
+                        {
+                            "cpu": float(10 + index),
+                            "ram": float(20 + index),
+                            "disk": float(30 + index),
+                            "network": float(40 + index),
+                        }
+                        for index in range(count)
+                    ]
+                    batch_sessions = [open_tcp_session() for _ in names]
+                    sessions.extend(batch_sessions)
+
+                    def run_client(index: int) -> list[str]:
+                        client_socket = batch_sessions[index][1]
+                        metric = metrics[index]
+                        return [
+                            exchange_tcp_message(
+                                client_socket,
+                                f"REGISTER|{names[index]}|127.0.0.1|8888",
+                            ),
+                            exchange_tcp_message(
+                                client_socket,
+                                "SYSTEM|{}|CPU={}|RAM={}|DISK={}|NETWORK={}".format(
+                                    names[index],
+                                    metric["cpu"],
+                                    metric["ram"],
+                                    metric["disk"],
+                                    metric["network"],
+                                ),
+                            ),
+                            exchange_tcp_message(
+                                client_socket, f"HEARTBEAT|{names[index]}"
+                            ),
+                        ]
+
+                    with ThreadPoolExecutor(max_workers=count) as executor:
+                        results = list(
+                            executor.map(run_client, range(count), timeout=30)
+                        )
+                    self.assertEqual(
+                        results,
+                        [
+                            ["OK|REGISTERED", "OK|SYSTEM", "OK|HEARTBEAT"]
+                            for _ in names
+                        ],
+                    )
+
+                    self.assertEqual(
+                        exchange_tcp_message(
+                            batch_sessions[0][1], f"LOGOUT|{names[0]}"
+                        ),
+                        "OK|LOGOUT",
+                    )
+                    batch_sessions[0][1].close()
+                    batch_sessions[0][2].join(timeout=2)
+                    self.assertFalse(batch_sessions[0][2].is_alive())
+                    self.assertEqual(
+                        server.clients[names[0].lower()]["status"], "OFFLINE"
+                    )
+
+                    if count > 1:
+                        batch_sessions[1][1].close()
+                        batch_sessions[1][2].join(timeout=2)
+                        self.assertFalse(batch_sessions[1][2].is_alive())
+                        self.assertEqual(
+                            server.clients[names[1].lower()]["status"], "ONLINE"
+                        )
+
+                    for name in names[2:]:
+                        self.assertEqual(
+                            server.clients[name.lower()]["status"], "ONLINE"
+                        )
+
+                    persisted_clients = {
+                        row["name"]: row
+                        for row in manager.get_clients()
+                        if row["name"] in names
+                    }
+                    self.assertEqual(set(persisted_clients), set(names))
+                    self.assertEqual(len(persisted_clients), count)
+                    for index, name in enumerate(names):
+                        record = persisted_clients[name]
+                        expected_status = "OFFLINE" if index == 0 else "ONLINE"
+                        self.assertEqual(record["status"], expected_status)
+                        self.assertIsNotNone(record["last_seen"])
+                        for metric_name, expected_value in metrics[index].items():
+                            self.assertEqual(record[metric_name], expected_value)
+
+                        history = manager.get_history(name)
+                        self.assertEqual(len(history), 1)
+                        for metric_name, expected_value in metrics[index].items():
+                            self.assertEqual(history[0][metric_name], expected_value)
+        finally:
+            for _, client_socket, _ in sessions:
+                client_socket.close()
+            for _, _, handler in sessions:
+                handler.join(timeout=2)
+                self.assertFalse(handler.is_alive())
+
+            try:
+                if test_names and manager.is_connected and manager.db_conn is not None:
+                    placeholders = ", ".join(["%s"] * len(test_names))
+                    cursor = manager.db_conn.cursor()
+                    try:
+                        for table in ("history", "alerts", "clients"):
+                            cursor.execute(
+                                f"DELETE FROM {table} "
+                                f"WHERE client_key IN ({placeholders})",
+                                tuple(test_names),
+                            )
+                        manager.db_conn.commit()
+                    except Exception:
+                        manager.db_conn.rollback()
+                        raise
+                    finally:
+                        cursor.close()
+            finally:
+                server.clients.clear()
+                server.clients.update(previous_clients)
+                server.disconnected_clients.clear()
+                server.disconnected_clients.update(previous_disconnected)
+                manager.close()
 
 
 class DatabaseStrictStorageTests(unittest.TestCase):
