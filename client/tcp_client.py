@@ -37,10 +37,26 @@ class TCPClient:
         if action == "SYSTEM":
             name = str(payload.get("name") or self.default_name).strip()
             metrics = []
-            for key in ("cpu", "ram", "disk", "network"):
+            for key in (
+                "cpu",
+                "ram",
+                "disk",
+                "network",
+                "upload_bytes_per_sec",
+                "download_bytes_per_sec",
+                "packets_sent",
+                "packets_recv",
+            ):
                 value = payload.get(key)
-                if value is not None:
-                    metrics.append(f"{key}={value}")
+                if key in payload:
+                    wire_key = {
+                        "upload_bytes_per_sec": "UPLOAD_BPS",
+                        "download_bytes_per_sec": "DOWNLOAD_BPS",
+                        "packets_sent": "PACKETS_SENT",
+                        "packets_recv": "PACKETS_RECV",
+                    }.get(key, key.upper())
+                    wire_value = "null" if value is None else str(value)
+                    metrics.append(f"{wire_key}={wire_value}")
             message = f"SYSTEM|{name}"
             if metrics:
                 message += "|" + "|".join(metrics)
@@ -161,13 +177,28 @@ class TCPClient:
     def heartbeat(self, name: str = "") -> Dict[str, Any]:
         return self.send("HEARTBEAT", {"name": name or self.default_name})
 
-    def send_metrics(self, name: str = "", cpu: float = 0, ram: float = 0, disk: float = 0, network: float = 0) -> Dict[str, Any]:
+    def send_metrics(
+        self,
+        name: str = "",
+        cpu: float = 0,
+        ram: float = 0,
+        disk: float = 0,
+        network: float = 0,
+        upload_bytes_per_sec: float | None = None,
+        download_bytes_per_sec: float | None = None,
+        packets_sent: int | None = None,
+        packets_recv: int | None = None,
+    ) -> Dict[str, Any]:
         return self.send("SYSTEM", {
             "name": name or self.default_name,
             "cpu": cpu,
             "ram": ram,
             "disk": disk,
             "network": network,
+            "upload_bytes_per_sec": upload_bytes_per_sec,
+            "download_bytes_per_sec": download_bytes_per_sec,
+            "packets_sent": packets_sent,
+            "packets_recv": packets_recv,
         })
 
     def list_peers(self) -> Dict[str, Any]:

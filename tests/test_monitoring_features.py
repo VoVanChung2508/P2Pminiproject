@@ -132,6 +132,81 @@ class ServerDisconnectTests(unittest.TestCase):
         self.assertIn(b"escapeHtml(value)", response.data)
         self.assertIn(b"escapeHtml(c.status)", response.data)
 
+    def test_dashboard_renders_network_rates_with_units(self) -> None:
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Network (Up / Down)", response.data)
+        self.assertIn(b"formatRate(c.upload_bytes_per_sec)", response.data)
+        self.assertIn(b"formatRate(c.download_bytes_per_sec)", response.data)
+        self.assertIn(b"upload_bytes_per_sec", response.data)
+        self.assertIn(b"download_bytes_per_sec", response.data)
+        self.assertIn(b"KiB/s", response.data)
+
+    def test_system_accepts_network_traffic_fields_and_rejects_invalid_rates(self) -> None:
+        metrics = {
+            "cpu": 12.0,
+            "ram": 34.0,
+            "disk": 56.0,
+            "network": 7.0,
+            "upload_bytes_per_sec": 125.5,
+            "download_bytes_per_sec": 256.25,
+            "packets_sent": 42,
+            "packets_recv": 84,
+        }
+        with patch.object(
+            server.db_manager,
+            "update_metrics",
+            wraps=server.db_manager.update_metrics,
+        ) as update_metrics:
+            response = server.handle_message(
+                "SYSTEM|node-01|CPU=12|RAM=34|DISK=56|NETWORK=7|"
+                "UPLOAD_BPS=125.5|DOWNLOAD_BPS=256.25|"
+                "PACKETS_SENT=42|PACKETS_RECV=84",
+                ("127.0.0.1", 30000),
+            )
+
+        self.assertEqual(response, "OK|SYSTEM")
+        update_metrics.assert_called_once_with("node-01", metrics)
+
+        invalid_response = server.handle_message(
+            "SYSTEM|node-01|UPLOAD_BPS=nan",
+            ("127.0.0.1", 30000),
+        )
+        self.assertTrue(invalid_response.startswith("ERROR|"))
+
+    def test_system_accepts_null_network_counters_and_legacy_messages(self) -> None:
+        with patch.object(
+            server.db_manager,
+            "update_metrics",
+            wraps=server.db_manager.update_metrics,
+        ) as update_metrics:
+            legacy_response = server.handle_message(
+                "SYSTEM|node-01|CPU=12|NETWORK=7",
+                ("127.0.0.1", 30000),
+            )
+            new_response = server.handle_message(
+                "SYSTEM|node-01|UPLOAD_BPS=null|DOWNLOAD_BPS=null|"
+                "PACKETS_SENT=null|PACKETS_RECV=null",
+                ("127.0.0.1", 30000),
+            )
+
+        self.assertEqual(legacy_response, "OK|SYSTEM")
+        self.assertEqual(new_response, "OK|SYSTEM")
+        self.assertEqual(
+            update_metrics.call_args_list[0].args[1],
+            {"cpu": 12.0, "network": 7.0},
+        )
+        self.assertEqual(
+            update_metrics.call_args_list[1].args[1],
+            {
+                "upload_bytes_per_sec": None,
+                "download_bytes_per_sec": None,
+                "packets_sent": None,
+                "packets_recv": None,
+            },
+        )
+
 
 class TCPClientSessionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -329,6 +404,10 @@ class TCPClientSessionTests(unittest.TestCase):
                     "ram": float(20 + index),
                     "disk": float(30 + index),
                     "network": float(40 + index),
+                    "upload_bytes_per_sec": float(100 + index),
+                    "download_bytes_per_sec": float(200 + index),
+                    "packets_sent": 300 + index,
+                    "packets_recv": 400 + index,
                 }
                 for index in range(count)
             ]
@@ -352,12 +431,17 @@ class TCPClientSessionTests(unittest.TestCase):
                 self.assertEqual(register_responses, ["OK|REGISTERED"] * count)
 
                 system_responses = broadcast(
-                    lambda index: "SYSTEM|{}|CPU={}|RAM={}|DISK={}|NETWORK={}".format(
+                    lambda index: "SYSTEM|{}|CPU={}|RAM={}|DISK={}|NETWORK={}"
+                    "|UPLOAD_BPS={}|DOWNLOAD_BPS={}|PACKETS_SENT={}|PACKETS_RECV={}".format(
                         names[index],
                         metrics[index]["cpu"],
                         metrics[index]["ram"],
                         metrics[index]["disk"],
                         metrics[index]["network"],
+                        metrics[index]["upload_bytes_per_sec"],
+                        metrics[index]["download_bytes_per_sec"],
+                        metrics[index]["packets_sent"],
+                        metrics[index]["packets_recv"],
                     )
                 )
                 self.assertEqual(system_responses, ["OK|SYSTEM"] * count)
@@ -1017,12 +1101,18 @@ class MySQLMultiClientIntegrationTests(unittest.TestCase):
                             ),
                             exchange_tcp_message(
                                 client_socket,
-                                "SYSTEM|{}|CPU={}|RAM={}|DISK={}|NETWORK={}".format(
+                                "SYSTEM|{}|CPU={}|RAM={}|DISK={}|NETWORK={}"
+                                "|UPLOAD_BPS={}|DOWNLOAD_BPS={}"
+                                "|PACKETS_SENT={}|PACKETS_RECV={}".format(
                                     names[index],
                                     metric["cpu"],
                                     metric["ram"],
                                     metric["disk"],
                                     metric["network"],
+                                    metric["upload_bytes_per_sec"],
+                                    metric["download_bytes_per_sec"],
+                                    metric["packets_sent"],
+                                    metric["packets_recv"],
                                 ),
                             ),
                             exchange_tcp_message(
@@ -1251,7 +1341,16 @@ class DatabaseStrictStorageTests(unittest.TestCase):
         self.assertTrue(
             manager.update_metrics(
                 "node-01",
-                {"cpu": 12.0, "ram": 34.0, "disk": 56.0, "network": 7.0},
+                {
+                    "cpu": 12.0,
+                    "ram": 34.0,
+                    "disk": 56.0,
+                    "network": 7.0,
+                    "upload_bytes_per_sec": 128.5,
+                    "download_bytes_per_sec": 256.25,
+                    "packets_sent": 42,
+                    "packets_recv": 84,
+                },
             )
         )
         self.assertTrue(manager.add_alert("node-01", "cpu", 90.0, 80.0))
@@ -1271,8 +1370,51 @@ class DatabaseStrictStorageTests(unittest.TestCase):
             sum("INSERT INTO alerts" in query for query in executed_sql),
             1,
         )
+        metrics_update = next(
+            call for call in manager.db_conn.cursor.return_value.execute.call_args_list
+            if "UPDATE clients" in call.args[0]
+        )
+        self.assertIn("upload_bytes_per_sec = %s", metrics_update.args[0])
+        self.assertIn("download_bytes_per_sec = %s", metrics_update.args[0])
+        self.assertEqual(metrics_update.args[1][4:8], (128.5, 256.25, 42, 84))
         self.assertEqual(manager.db_conn.commit.call_count, 3)
         self.assertEqual(manager.db_conn.rollback.call_count, 3)
+
+    def test_schema_adds_nullable_network_traffic_columns(self) -> None:
+        manager = database.DatabaseManager()
+        manager.db_conn = Mock()
+        cursor = manager.db_conn.cursor.return_value
+        cursor.fetchone.return_value = None
+        manager.is_connected = True
+
+        manager._create_tables()
+
+        alters = [
+            call.args[0]
+            for call in cursor.execute.call_args_list
+            if call.args[0].startswith("ALTER TABLE")
+        ]
+        self.assertEqual(len(alters), 8)
+        self.assertTrue(any("clients` ADD COLUMN `upload_bytes_per_sec`" in query for query in alters))
+        self.assertTrue(any("history` ADD COLUMN `download_bytes_per_sec`" in query for query in alters))
+        self.assertTrue(any("packets_sent` BIGINT UNSIGNED NULL" in query for query in alters))
+        manager.db_conn.commit.assert_called_once_with()
+
+    def test_schema_migration_does_not_alter_existing_network_columns(self) -> None:
+        manager = database.DatabaseManager()
+        manager.db_conn = Mock()
+        cursor = manager.db_conn.cursor.return_value
+        cursor.fetchone.return_value = (1,)
+        manager.is_connected = True
+
+        manager._create_tables()
+
+        self.assertFalse(
+            any(
+                call.args[0].startswith("ALTER TABLE")
+                for call in cursor.execute.call_args_list
+            )
+        )
 
     def test_health_check_reconnects_and_next_read_uses_mysql(self) -> None:
         manager = database.DatabaseManager(create_database=False)
@@ -1466,10 +1608,14 @@ class DatabaseStrictStorageTests(unittest.TestCase):
         manager.is_connected = True
         cursor = manager.db_conn.cursor.return_value
         cursor.fetchall.side_effect = [
-            [("node-01", "127.0.0.1", 12, 34, 56, 7, "OFFLINE", "2025-01-01", "2024-12-01")],
+            [(
+                "node-01", "127.0.0.1", 12, 34, 56, 7,
+                128.5, 256.25, 42, 84,
+                "OFFLINE", "2025-01-01", "2024-12-01",
+            )],
             [
-                (20, 30, 40, 2, "2025-01-02 12:00:00"),
-                (10, 20, 30, 1, "2025-01-01 12:00:00"),
+                (20, 30, 40, 2, 128.5, 256.25, 42, 84, "2025-01-02 12:00:00"),
+                (10, 20, 30, 1, 64.0, 128.0, 20, 40, "2025-01-01 12:00:00"),
             ],
             [("node-01", "CPU", 90, 80, "2025-01-03 12:00:00")],
         ]
@@ -1480,6 +1626,10 @@ class DatabaseStrictStorageTests(unittest.TestCase):
 
         self.assertEqual(clients[0]["status"], "OFFLINE")
         self.assertEqual(clients[0]["cpu"], 12.0)
+        self.assertEqual(clients[0]["upload_bytes_per_sec"], 128.5)
+        self.assertEqual(clients[0]["packets_sent"], 42)
+        self.assertEqual(history[0]["download_bytes_per_sec"], 128.0)
+        self.assertEqual(history[1]["packets_recv"], 84)
         self.assertEqual(
             [sample["timestamp"] for sample in history],
             ["2025-01-01 12:00:00", "2025-01-02 12:00:00"],
@@ -1560,6 +1710,10 @@ class PersistentDashboardAPITests(unittest.TestCase):
             "ram": 34.0,
             "disk": 56.0,
             "network": 7.0,
+            "upload_bytes_per_sec": 128.5,
+            "download_bytes_per_sec": 256.25,
+            "packets_sent": 42,
+            "packets_recv": 84,
             "status": "OFFLINE",
             "last_seen": "2025-01-01 12:00:00",
             "registered_at": "2024-12-01 12:00:00",
@@ -1569,6 +1723,10 @@ class PersistentDashboardAPITests(unittest.TestCase):
             "ram": 34.0,
             "disk": 56.0,
             "network": 7.0,
+            "upload_bytes_per_sec": 128.5,
+            "download_bytes_per_sec": 256.25,
+            "packets_sent": 42,
+            "packets_recv": 84,
             "timestamp": "2025-01-01 12:00:00",
         }
         stored_alert = {
@@ -1590,6 +1748,14 @@ class PersistentDashboardAPITests(unittest.TestCase):
         self.assertEqual(clients_response.status_code, 200)
         self.assertEqual(clients_response.get_json()["clients"][0]["status"], "OFFLINE")
         self.assertEqual(clients_response.get_json()["clients"][0]["cpu"], 12.0)
+        self.assertEqual(
+            clients_response.get_json()["clients"][0]["upload_bytes_per_sec"],
+            128.5,
+        )
+        self.assertEqual(
+            clients_response.get_json()["clients"][0]["packets_recv"],
+            84,
+        )
         self.assertEqual(
             clients_response.get_json()["clients"][0]["last_seen"],
             "2025-01-01 12:00:00",
@@ -1644,6 +1810,106 @@ class ClientForcedDisconnectTests(unittest.TestCase):
             )
         )
         self.assertFalse(monitoring_client.was_disconnected_by_server({"status": "ok"}))
+
+
+class NetworkTrafficCollectorTests(unittest.TestCase):
+    @staticmethod
+    def _fake_psutil(counters):
+        return Mock(
+            cpu_percent=Mock(return_value=10.0),
+            virtual_memory=Mock(return_value=Mock(percent=20.0)),
+            disk_usage=Mock(return_value=Mock(percent=30.0)),
+            net_io_counters=Mock(side_effect=counters),
+        )
+
+    def test_collector_uses_elapsed_time_for_upload_and_download_rates(self) -> None:
+        client = monitoring_client.NetworkMonitoringClient("node-01")
+        fake_psutil = self._fake_psutil(
+            [
+                Mock(bytes_sent=100, bytes_recv=200, packets_sent=3, packets_recv=4),
+                Mock(bytes_sent=300, bytes_recv=600, packets_sent=7, packets_recv=9),
+            ]
+        )
+        with patch.object(monitoring_client, "psutil", fake_psutil):
+            with patch.object(monitoring_client.time, "monotonic", side_effect=[10.0, 12.0]):
+                first = client.collect_system_metrics()
+                second = client.collect_system_metrics()
+
+        self.assertEqual(first["upload_bytes_per_sec"], 0.0)
+        self.assertEqual(first["download_bytes_per_sec"], 0.0)
+        self.assertEqual(second["upload_bytes_per_sec"], 100.0)
+        self.assertEqual(second["download_bytes_per_sec"], 200.0)
+        self.assertEqual(second["packets_sent"], 7)
+        self.assertEqual(second["packets_recv"], 9)
+
+    def test_counter_reset_rebaselines_and_reports_zero_directional_rate(self) -> None:
+        client = monitoring_client.NetworkMonitoringClient("node-01")
+        fake_psutil = self._fake_psutil(
+            [
+                Mock(bytes_sent=1000, bytes_recv=2000, packets_sent=30, packets_recv=40),
+                Mock(bytes_sent=10, bytes_recv=20, packets_sent=1, packets_recv=2),
+                Mock(bytes_sent=110, bytes_recv=220, packets_sent=5, packets_recv=8),
+            ]
+        )
+        with patch.object(monitoring_client, "psutil", fake_psutil):
+            with patch.object(
+                monitoring_client.time,
+                "monotonic",
+                side_effect=[1.0, 2.0, 3.0],
+            ):
+                client.collect_system_metrics()
+                reset_sample = client.collect_system_metrics()
+                next_sample = client.collect_system_metrics()
+
+        self.assertEqual(reset_sample["upload_bytes_per_sec"], 0.0)
+        self.assertEqual(reset_sample["download_bytes_per_sec"], 0.0)
+        self.assertEqual(next_sample["upload_bytes_per_sec"], 100.0)
+        self.assertEqual(next_sample["download_bytes_per_sec"], 200.0)
+
+    def test_unavailable_network_counters_are_returned_as_null(self) -> None:
+        client = monitoring_client.NetworkMonitoringClient("node-01")
+        fake_psutil = self._fake_psutil([None])
+        with patch.object(monitoring_client, "psutil", fake_psutil):
+            with patch.object(monitoring_client.time, "monotonic", return_value=1.0):
+                with self.assertLogs(monitoring_client.logger, level="WARNING"):
+                    metrics = client.collect_system_metrics()
+
+        self.assertEqual(metrics["network"], 0.0)
+        self.assertIsNone(metrics["upload_bytes_per_sec"])
+        self.assertIsNone(metrics["download_bytes_per_sec"])
+        self.assertIsNone(metrics["packets_sent"])
+        self.assertIsNone(metrics["packets_recv"])
+
+    def test_protocol_keeps_legacy_field_and_adds_named_rates(self) -> None:
+        client = tcp_client.TCPClient(default_name="node-01")
+        legacy_message = client._build_message(
+            "SYSTEM",
+            {"name": "node-01", "cpu": 1, "ram": 2, "disk": 3, "network": 4},
+        )
+        extended_message = client._build_message(
+            "SYSTEM",
+            {
+                "name": "node-01",
+                "cpu": 1,
+                "ram": 2,
+                "disk": 3,
+                "network": 4,
+                "upload_bytes_per_sec": 128.5,
+                "download_bytes_per_sec": 256.0,
+                "packets_sent": 10,
+                "packets_recv": None,
+            },
+        )
+
+        self.assertEqual(
+            legacy_message,
+            "SYSTEM|node-01|CPU=1|RAM=2|DISK=3|NETWORK=4",
+        )
+        self.assertIn("NETWORK=4", extended_message)
+        self.assertIn("UPLOAD_BPS=128.5", extended_message)
+        self.assertIn("DOWNLOAD_BPS=256.0", extended_message)
+        self.assertIn("PACKETS_SENT=10", extended_message)
+        self.assertIn("PACKETS_RECV=null", extended_message)
 
 
 class _Value:

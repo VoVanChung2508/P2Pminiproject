@@ -349,6 +349,14 @@ class DatabaseManager:
 
                     network FLOAT DEFAULT 0,
 
+                    upload_bytes_per_sec DOUBLE NULL,
+
+                    download_bytes_per_sec DOUBLE NULL,
+
+                    packets_sent BIGINT UNSIGNED NULL,
+
+                    packets_recv BIGINT UNSIGNED NULL,
+
                     status VARCHAR(20)
                         DEFAULT 'ONLINE',
 
@@ -382,6 +390,14 @@ class DatabaseManager:
                     disk FLOAT NOT NULL,
 
                     network FLOAT NOT NULL,
+
+                    upload_bytes_per_sec DOUBLE NULL,
+
+                    download_bytes_per_sec DOUBLE NULL,
+
+                    packets_sent BIGINT UNSIGNED NULL,
+
+                    packets_recv BIGINT UNSIGNED NULL,
 
                     timestamp DATETIME NOT NULL,
 
@@ -424,6 +440,38 @@ class DatabaseManager:
                 DEFAULT CHARSET=utf8mb4;
                 """
             )
+
+            additive_columns = {
+                "clients": {
+                    "upload_bytes_per_sec": "DOUBLE NULL",
+                    "download_bytes_per_sec": "DOUBLE NULL",
+                    "packets_sent": "BIGINT UNSIGNED NULL",
+                    "packets_recv": "BIGINT UNSIGNED NULL",
+                },
+                "history": {
+                    "upload_bytes_per_sec": "DOUBLE NULL",
+                    "download_bytes_per_sec": "DOUBLE NULL",
+                    "packets_sent": "BIGINT UNSIGNED NULL",
+                    "packets_recv": "BIGINT UNSIGNED NULL",
+                },
+            }
+            for table_name, columns in additive_columns.items():
+                for column_name, column_definition in columns.items():
+                    cursor.execute(
+                        """
+                        SELECT 1
+                        FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = %s
+                          AND TABLE_NAME = %s
+                          AND COLUMN_NAME = %s
+                        """,
+                        (self.database, table_name, column_name),
+                    )
+                    if cursor.fetchone() is None:
+                        cursor.execute(
+                            f"ALTER TABLE `{table_name}` "
+                            f"ADD COLUMN `{column_name}` {column_definition}"
+                        )
 
             self.db_conn.commit()
 
@@ -670,7 +718,7 @@ class DatabaseManager:
     def update_metrics(
         self,
         name: str,
-        metrics: Dict[str, float]
+        metrics: Dict[str, Any]
     ) -> bool:
 
         if not self._check_connection():
@@ -686,6 +734,10 @@ class DatabaseManager:
         ram = float(metrics.get("ram", 0.0))
         disk = float(metrics.get("disk", 0.0))
         network = float(metrics.get("network", 0.0))
+        upload_bytes_per_sec = metrics.get("upload_bytes_per_sec")
+        download_bytes_per_sec = metrics.get("download_bytes_per_sec")
+        packets_sent = metrics.get("packets_sent")
+        packets_recv = metrics.get("packets_recv")
 
         cursor = None
         try:
@@ -703,6 +755,10 @@ class DatabaseManager:
                 ram = %s,
                 disk = %s,
                 network = %s,
+                upload_bytes_per_sec = %s,
+                download_bytes_per_sec = %s,
+                packets_sent = %s,
+                packets_recv = %s,
                 status = 'ONLINE',
                 last_seen = %s
 
@@ -716,6 +772,10 @@ class DatabaseManager:
                     ram,
                     disk,
                     network,
+                    upload_bytes_per_sec,
+                    download_bytes_per_sec,
+                    packets_sent,
+                    packets_recv,
                     now,
                     key
                 )
@@ -745,11 +805,19 @@ class DatabaseManager:
                 ram,
                 disk,
                 network,
+                upload_bytes_per_sec,
+                download_bytes_per_sec,
+                packets_sent,
+                packets_recv,
                 timestamp
             )
 
             VALUES
             (
+                %s,
+                %s,
+                %s,
+                %s,
                 %s,
                 %s,
                 %s,
@@ -767,6 +835,10 @@ class DatabaseManager:
                     ram,
                     disk,
                     network,
+                    upload_bytes_per_sec,
+                    download_bytes_per_sec,
+                    packets_sent,
+                    packets_recv,
                     now
                 )
             )
@@ -783,7 +855,9 @@ class DatabaseManager:
                 f"CPU={cpu}% | "
                 f"RAM={ram}% | "
                 f"Disk={disk}% | "
-                f"Network={network}"
+                f"LegacyNetwork={network} | "
+                f"UploadBps={upload_bytes_per_sec} | "
+                f"DownloadBps={download_bytes_per_sec}"
             )
 
             return True
@@ -1001,7 +1075,10 @@ class DatabaseManager:
         rows = self._read_rows(
             "get_clients",
             """
-            SELECT name, ip, cpu, ram, disk, network, status, last_seen, registered_at
+            SELECT name, ip, cpu, ram, disk, network,
+                   upload_bytes_per_sec, download_bytes_per_sec,
+                   packets_sent, packets_recv,
+                   status, last_seen, registered_at
             FROM clients
             ORDER BY name
             """,
@@ -1014,9 +1091,17 @@ class DatabaseManager:
                 "ram": float(row[3] or 0),
                 "disk": float(row[4] or 0),
                 "network": float(row[5] or 0),
-                "status": row[6],
-                "last_seen": self._format_datetime(row[7]),
-                "registered_at": self._format_datetime(row[8]),
+                "upload_bytes_per_sec": (
+                    float(row[6]) if row[6] is not None else None
+                ),
+                "download_bytes_per_sec": (
+                    float(row[7]) if row[7] is not None else None
+                ),
+                "packets_sent": int(row[8]) if row[8] is not None else None,
+                "packets_recv": int(row[9]) if row[9] is not None else None,
+                "status": row[10],
+                "last_seen": self._format_datetime(row[11]),
+                "registered_at": self._format_datetime(row[12]),
             }
             for row in rows
         ]
@@ -1028,7 +1113,9 @@ class DatabaseManager:
         rows = self._read_rows(
             "get_history",
             """
-            SELECT cpu, ram, disk, network, timestamp
+            SELECT cpu, ram, disk, network,
+                   upload_bytes_per_sec, download_bytes_per_sec,
+                   packets_sent, packets_recv, timestamp
             FROM history
             WHERE client_key = %s
             ORDER BY timestamp DESC, id DESC
@@ -1042,7 +1129,15 @@ class DatabaseManager:
                 "ram": float(row[1]),
                 "disk": float(row[2]),
                 "network": float(row[3]),
-                "timestamp": self._format_datetime(row[4]),
+                "upload_bytes_per_sec": (
+                    float(row[4]) if row[4] is not None else None
+                ),
+                "download_bytes_per_sec": (
+                    float(row[5]) if row[5] is not None else None
+                ),
+                "packets_sent": int(row[6]) if row[6] is not None else None,
+                "packets_recv": int(row[7]) if row[7] is not None else None,
+                "timestamp": self._format_datetime(row[8]),
             }
             for row in reversed(rows)
         ]

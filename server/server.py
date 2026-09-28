@@ -61,6 +61,26 @@ def parse_metric(value: str, name: str) -> float:
     return round(number, 1)
 
 
+def parse_network_rate(value: str, name: str) -> float | None:
+    if value.strip().lower() == "null":
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return number
+
+
+def parse_packet_counter(value: str, name: str) -> int | None:
+    if value.strip().lower() == "null":
+        return None
+    if not value.isdigit():
+        raise ValueError(f"{name} must be a non-negative integer")
+    number = int(value)
+    if number > 18446744073709551615:
+        raise ValueError(f"{name} exceeds the supported counter range")
+    return number
+
+
 def register_client(
     name: str,
     ip: str,
@@ -448,12 +468,28 @@ def handle_message(message: str, address: tuple[str, int]) -> str:
                 return process_command
             return "OK|HEARTBEAT"
         if command == "SYSTEM" and len(parts) >= 2:
-            metrics: dict[str, float] = {}
+            metrics: dict[str, float | int | None] = {}
             for item in parts[2:]:
                 key, value = item.split("=", 1)
                 metric_name = key.lower()
                 if metric_name in {"cpu", "ram", "disk", "network"}:
                     metrics[metric_name] = parse_metric(value.rstrip("%"), metric_name)
+                elif metric_name in {
+                    "upload_bps",
+                    "download_bps",
+                    "packets_sent",
+                    "packets_recv",
+                }:
+                    api_name = {
+                        "upload_bps": "upload_bytes_per_sec",
+                        "download_bps": "download_bytes_per_sec",
+                        "packets_sent": "packets_sent",
+                        "packets_recv": "packets_recv",
+                    }[metric_name]
+                    if metric_name in {"upload_bps", "download_bps"}:
+                        metrics[api_name] = parse_network_rate(value, api_name)
+                    else:
+                        metrics[api_name] = parse_packet_counter(value, api_name)
             if not metrics:
                 return "ERROR|No metrics supplied"
             if not update_system(parts[1], metrics):
@@ -859,7 +895,12 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
       <canvas id="ram-chart" width="320" height="180"></canvas>
     </div>
     <div class="chart-card">
-      <div class="chart-head"><h3>Network Traffic</h3><span class="chart-value" id="network-value">0%</span></div>
+      <div class="chart-head"><h3>Network Traffic</h3><span class="chart-value" id="network-value">Up: — · Down: —</span></div>
+      <div style="font-size:11px;color:var(--subtext);margin:-4px 0 8px">
+        <span style="color:#a78bfa">● Upload</span>
+        <span style="color:#34d399;margin-left:10px">● Download</span>
+        <span> (bytes/sec)</span>
+      </div>
       <canvas id="network-chart" width="320" height="180"></canvas>
     </div>
   </div>
@@ -876,7 +917,7 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
               <th>CPU</th>
               <th>RAM</th>
               <th>Disk</th>
-              <th>Network</th>
+              <th>Network (Up / Down)</th>
               <th>Last Seen</th>
               <th>Trạng thái</th>
               <th>Thao tác</th>
@@ -918,11 +959,24 @@ function renderMetric(val) {
   return `<div class="bar-wrap"><span>${num}%</span><div class="bar"><div class="fill ${cls}" style="width:${Math.min(100, num)}%"></div></div></div>`;
 }
 
+function formatRate(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '—';
+  let amount = Number(value);
+  const units = ['B/s', 'KiB/s', 'MiB/s', 'GiB/s', 'TiB/s'];
+  let unitIndex = 0;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex += 1;
+  }
+  return `${amount.toFixed(1)} ${units[unitIndex]}`;
+}
+
 function normalizeHistory(samples = []) {
   return samples.slice(-30).map((sample) => ({
     cpu: Number(sample.cpu || 0),
     ram: Number(sample.ram || 0),
-    network: Number(sample.network || 0),
+    upload: sample.upload_bytes_per_sec == null ? null : Number(sample.upload_bytes_per_sec),
+    download: sample.download_bytes_per_sec == null ? null : Number(sample.download_bytes_per_sec),
     timestamp: sample.timestamp || Date.now()
   }));
 }
@@ -977,19 +1031,76 @@ function renderCharts(historySamples) {
   const history = normalizeHistory(historySamples);
   const cpuValues = history.map(item => item.cpu);
   const ramValues = history.map(item => item.ram);
-  const networkValues = history.map(item => item.network);
+  const uploadValues = history.map(item => item.upload);
+  const downloadValues = history.map(item => item.download);
 
   const cpuCurrent = cpuValues.length ? cpuValues[cpuValues.length - 1] : 0;
   const ramCurrent = ramValues.length ? ramValues[ramValues.length - 1] : 0;
-  const networkCurrent = networkValues.length ? networkValues[networkValues.length - 1] : 0;
+  const uploadCurrent = uploadValues.length ? uploadValues[uploadValues.length - 1] : null;
+  const downloadCurrent = downloadValues.length ? downloadValues[downloadValues.length - 1] : null;
 
   document.getElementById('cpu-value').textContent = `${cpuCurrent.toFixed(0)}%`;
   document.getElementById('ram-value').textContent = `${ramCurrent.toFixed(0)}%`;
-  document.getElementById('network-value').textContent = `${networkCurrent.toFixed(0)}%`;
+  document.getElementById('network-value').textContent =
+    `Up: ${formatRate(uploadCurrent)} · Down: ${formatRate(downloadCurrent)}`;
 
   drawChart('cpu-chart', cpuValues, '#38bdf8');
   drawChart('ram-chart', ramValues, '#22c55e');
-  drawChart('network-chart', networkValues, '#a78bfa');
+  drawNetworkChart('network-chart', uploadValues, downloadValues);
+}
+
+function drawNetworkChart(canvasId, uploadValues, downloadValues) {
+  const values = [...uploadValues, ...downloadValues]
+    .filter(value => value != null && Number.isFinite(value));
+  if (values.length === 0) {
+    drawChart(canvasId, [], '#a78bfa');
+    return;
+  }
+
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext('2d');
+  const width = canvas.width = Math.max(canvas.clientWidth * 2, 320);
+  const height = canvas.height = 180 * 2;
+  const pad = 18;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#020817';
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = 'rgba(148,163,184,0.18)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad + ((height - pad * 2) / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(pad, y);
+    ctx.lineTo(width - pad, y);
+    ctx.stroke();
+  }
+
+  const maxVal = Math.max(...values, 1);
+  const stepX = (width - pad * 2) / Math.max(uploadValues.length - 1, 1);
+  for (const [series, color] of [
+    [uploadValues, '#a78bfa'],
+    [downloadValues, '#34d399']
+  ]) {
+    ctx.beginPath();
+    let started = false;
+    series.forEach((value, index) => {
+      if (value == null || !Number.isFinite(value)) {
+        started = false;
+        return;
+      }
+      const x = pad + index * stepX;
+      const y = height - pad - ((value / maxVal) * (height - pad * 2));
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+  }
 }
 
 async function fetchClientHistory(clientName) {
@@ -1046,7 +1157,7 @@ async function refresh() {
           <td style="min-width:110px">${renderMetric(c.cpu)}</td>
           <td style="min-width:110px">${renderMetric(c.ram)}</td>
           <td style="min-width:110px">${renderMetric(c.disk)}</td>
-          <td style="min-width:110px">${renderMetric(c.network)}</td>
+          <td style="min-width:150px">↑ ${formatRate(c.upload_bytes_per_sec)}<br>↓ ${formatRate(c.download_bytes_per_sec)}</td>
           <td>${renderLastSeen(c.last_seen)}</td>
           <td><span class="${c.status === 'ONLINE' ? 'online-tag' : 'offline-tag'}">${escapeHtml(c.status)}</span></td>
           <td><button class="disconnect-button" type="button" ${c.status !== 'ONLINE' || !adminDisconnectEnabled ? 'disabled' : ''}>Ngắt</button></td>

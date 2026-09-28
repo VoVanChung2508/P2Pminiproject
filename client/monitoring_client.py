@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import socket
 import sys
@@ -43,6 +44,19 @@ except ImportError:
 
 DEFAULT_HTTP_PORT = int(os.environ.get("MONITOR_HTTP_PORT", "8081"))
 DEFAULT_TCP_PORT = int(os.environ.get("MONITOR_TCP_PORT", "8888"))
+logger = logging.getLogger(__name__)
+
+
+def format_bytes_per_second(value: float | None) -> str:
+    if value is None:
+        return "Unavailable"
+    units = ("B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} TiB/s"
 
 
 def was_disconnected_by_server(response: Dict[str, Any]) -> bool:
@@ -82,7 +96,7 @@ class NetworkMonitoringClient:
         else:
             self.http_client = None
 
-        self._last_net_bytes: Optional[int] = None
+        self._last_net_counters: Optional[tuple[int, int, int, int]] = None
         self._last_net_time: Optional[float] = None
 
     def register(self) -> Dict[str, Any]:
@@ -98,20 +112,55 @@ class NetworkMonitoringClient:
         return self._raw_tcp_send(f"HEARTBEAT|{self.name}")
 
     def send_metrics(
-        self, cpu: float = 0.0, ram: float = 0.0, disk: float = 0.0, network: float = 0.0
+        self,
+        cpu: float = 0.0,
+        ram: float = 0.0,
+        disk: float = 0.0,
+        network: float = 0.0,
+        upload_bytes_per_sec: float | None = None,
+        download_bytes_per_sec: float | None = None,
+        packets_sent: int | None = None,
+        packets_recv: int | None = None,
     ) -> Dict[str, Any]:
         """Send real-time resource metrics to the server."""
         if self.tcp_client:
             return self.tcp_client.send_metrics(
-                self.name, cpu=cpu, ram=ram, disk=disk, network=network
+                self.name,
+                cpu=cpu,
+                ram=ram,
+                disk=disk,
+                network=network,
+                upload_bytes_per_sec=upload_bytes_per_sec,
+                download_bytes_per_sec=download_bytes_per_sec,
+                packets_sent=packets_sent,
+                packets_recv=packets_recv,
             )
-        msg = f"SYSTEM|{self.name}|cpu={cpu}|ram={ram}|disk={disk}|network={network}"
+        fields = [
+            f"cpu={cpu}",
+            f"ram={ram}",
+            f"disk={disk}",
+            f"network={network}",
+            f"upload_bps={upload_bytes_per_sec if upload_bytes_per_sec is not None else 'null'}",
+            f"download_bps={download_bytes_per_sec if download_bytes_per_sec is not None else 'null'}",
+            f"packets_sent={packets_sent if packets_sent is not None else 'null'}",
+            f"packets_recv={packets_recv if packets_recv is not None else 'null'}",
+        ]
+        msg = f"SYSTEM|{self.name}|" + "|".join(fields)
         return self._raw_tcp_send(msg)
 
-    def collect_system_metrics(self) -> Dict[str, float]:
+    def collect_system_metrics(self) -> Dict[str, Any]:
         """Collect actual hardware metrics using psutil."""
         if psutil is None:
-            return {"cpu": 0.0, "ram": 0.0, "disk": 0.0, "network": 0.0}
+            return {
+                "cpu": 0.0,
+                "ram": 0.0,
+                "disk": 0.0,
+                "network": 0.0,
+                "upload_bytes_per_sec": None,
+                "download_bytes_per_sec": None,
+                "packets_sent": None,
+                "packets_recv": None,
+            }
 
         cpu = round(float(psutil.cpu_percent(interval=0.1)), 1)
         ram = round(float(psutil.virtual_memory().percent), 1)
@@ -123,21 +172,67 @@ class NetworkMonitoringClient:
             disk = 0.0
 
         network = 0.0
+        upload_bytes_per_sec: float | None = None
+        download_bytes_per_sec: float | None = None
+        packets_sent: int | None = None
+        packets_recv: int | None = None
         try:
             net_io = psutil.net_io_counters()
-            current_bytes = net_io.bytes_sent + net_io.bytes_recv
-            current_time = time.time()
-            if self._last_net_bytes is not None and self._last_net_time is not None:
+            if net_io is None:
+                raise RuntimeError("Network I/O counters are unavailable.")
+            current_counters = (
+                int(net_io.bytes_sent),
+                int(net_io.bytes_recv),
+                int(net_io.packets_sent),
+                int(net_io.packets_recv),
+            )
+            packets_sent = current_counters[2]
+            packets_recv = current_counters[3]
+            current_time = time.monotonic()
+            if (
+                self._last_net_counters is not None
+                and self._last_net_time is not None
+            ):
                 elapsed = max(0.001, current_time - self._last_net_time)
-                bytes_per_sec = (current_bytes - self._last_net_bytes) / elapsed
-                # Scale network activity (e.g. 10MB/s reference bandwidth -> 100%)
-                network = round(min(100.0, max(0.0, (bytes_per_sec / (10 * 1024 * 1024)) * 100.0)), 1)
-            self._last_net_bytes = current_bytes
+                sent_delta = current_counters[0] - self._last_net_counters[0]
+                received_delta = current_counters[1] - self._last_net_counters[1]
+                if sent_delta < 0 or received_delta < 0:
+                    upload_bytes_per_sec = 0.0
+                    download_bytes_per_sec = 0.0
+                else:
+                    upload_bytes_per_sec = round(sent_delta / elapsed, 2)
+                    download_bytes_per_sec = round(received_delta / elapsed, 2)
+                legacy_bytes_per_sec = (
+                    max(0, sent_delta) + max(0, received_delta)
+                ) / elapsed
+                network = round(
+                    min(
+                        100.0,
+                        (legacy_bytes_per_sec / (10 * 1024 * 1024)) * 100.0,
+                    ),
+                    1,
+                )
+            else:
+                upload_bytes_per_sec = 0.0
+                download_bytes_per_sec = 0.0
+            self._last_net_counters = current_counters
             self._last_net_time = current_time
-        except Exception:
-            network = 0.0
+        except Exception as exc:
+            logger.warning(
+                "Network counter collection failed (%s).",
+                type(exc).__name__,
+            )
 
-        return {"cpu": cpu, "ram": ram, "disk": disk, "network": network}
+        return {
+            "cpu": cpu,
+            "ram": ram,
+            "disk": disk,
+            "network": network,
+            "upload_bytes_per_sec": upload_bytes_per_sec,
+            "download_bytes_per_sec": download_bytes_per_sec,
+            "packets_sent": packets_sent,
+            "packets_recv": packets_recv,
+        }
 
     def list_peers(self) -> Any:
         """Query REST API for list of connected clients."""
@@ -227,7 +322,7 @@ class ClientGUI:
         self.cpu_var = tk.StringVar(value="0.0%")
         self.ram_var = tk.StringVar(value="0.0%")
         self.disk_var = tk.StringVar(value="0.0%")
-        self.net_var = tk.StringVar(value="0.0%")
+        self.net_var = tk.StringVar(value="Up: 0 B/s | Down: 0 B/s")
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -303,10 +398,8 @@ class ClientGUI:
         ttk.Label(m_grid, textvariable=self.disk_var, width=8).grid(row=1, column=2, sticky="w")
 
         # Network
-        ttk.Label(m_grid, text="Network Load:", font=("Segoe UI", 9, "bold")).grid(row=1, column=3, sticky="w", padx=(10, 0), pady=4)
-        self.net_bar = ttk.Progressbar(m_grid, maximum=100)
-        self.net_bar.grid(row=1, column=4, sticky="ew", padx=8, pady=4)
-        ttk.Label(m_grid, textvariable=self.net_var, width=8).grid(row=1, column=5, sticky="w")
+        ttk.Label(m_grid, text="Network Traffic:", font=("Segoe UI", 9, "bold")).grid(row=1, column=3, sticky="w", padx=(10, 0), pady=4)
+        ttk.Label(m_grid, textvariable=self.net_var).grid(row=1, column=4, columnspan=2, sticky="w", padx=8, pady=4)
 
         # Controls Panel
         btn_frame = ttk.Frame(self.root, padding=6)
@@ -421,7 +514,7 @@ class ClientGUI:
                 self.root.after(
                     0,
                     self.append_log,
-                    f"Gửi số liệu: CPU {metrics['cpu']}% | RAM {metrics['ram']}% | DISK {metrics['disk']}% | NET {metrics['network']}% -> {res_metric.get('status')}",
+                    f"Gửi số liệu: CPU {metrics['cpu']}% | RAM {metrics['ram']}% | DISK {metrics['disk']}% | UP {format_bytes_per_second(metrics.get('upload_bytes_per_sec'))} | DOWN {format_bytes_per_second(metrics.get('download_bytes_per_sec'))} -> {res_metric.get('status')}",
                 )
             except Exception as exc:
                 self.root.after(0, self.append_log, f"Lỗi trong chu kỳ gửi: {exc}")
@@ -432,11 +525,12 @@ class ClientGUI:
                     break
                 time.sleep(0.5)
 
-    def _update_metrics_ui(self, m: dict[str, float]) -> None:
+    def _update_metrics_ui(self, m: dict[str, Any]) -> None:
         cpu = m.get("cpu", 0.0)
         ram = m.get("ram", 0.0)
         disk = m.get("disk", 0.0)
-        net = m.get("network", 0.0)
+        upload = m.get("upload_bytes_per_sec")
+        download = m.get("download_bytes_per_sec")
 
         self.cpu_bar["value"] = cpu
         self.cpu_var.set(f"{cpu}%")
@@ -447,8 +541,10 @@ class ClientGUI:
         self.disk_bar["value"] = disk
         self.disk_var.set(f"{disk}%")
 
-        self.net_bar["value"] = net
-        self.net_var.set(f"{net}%")
+        self.net_var.set(
+            f"Up: {format_bytes_per_second(upload)} | "
+            f"Down: {format_bytes_per_second(download)}"
+        )
 
     def stop_monitoring(self) -> None:
         if not self.is_monitoring:
@@ -535,7 +631,8 @@ def run_cli(
                 f"CPU={metrics['cpu']:>5.1f}% | "
                 f"RAM={metrics['ram']:>5.1f}% | "
                 f"DISK={metrics['disk']:>5.1f}% | "
-                f"NET={metrics['network']:>5.1f}% | "
+                f"UP={format_bytes_per_second(metrics.get('upload_bytes_per_sec'))} | "
+                f"DOWN={format_bytes_per_second(metrics.get('download_bytes_per_sec'))} | "
                 f"Send={metric_res.get('status')} | "
                 f"HB={hb_res.get('status')}"
             )

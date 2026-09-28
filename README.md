@@ -9,6 +9,7 @@ Hệ thống giám sát hiệu năng mạng và tài nguyên máy trạm (Node/C
 - **Máy chủ Giám sát Đa luồng (Multi-threaded Server)**:
   - Lắng nghe kết nối TCP từ nhiều máy trạm đồng thời.
   - Thu thập và cập nhật liên tục các chỉ số tài nguyên: **CPU**, **RAM**, **Disk**, **Network**.
+  - Ghi nhận lưu lượng mạng gửi/nhận thực tế (bytes/giây) và số gói gửi/nhận từ bộ đếm tổng của máy.
   - Cơ chế **Heartbeat** tự động phát hiện thiết bị mất kết nối (`ONLINE` -> `OFFLINE` sau 15 giây).
   - Hệ thống cảnh báo tự động khi các chỉ số vượt ngưỡng an toàn (CPU > 80%, RAM > 80%, Disk > 90%).
 - **Lưu trữ bền vững trực tiếp trong MySQL**:
@@ -133,8 +134,10 @@ Nếu chưa cấu hình khóa, server vẫn khởi động nhưng thao tác ng�
 
 ### 4. Cấu trúc Các Bảng Dữ liệu (Schema)
 Khi `MYSQL_CREATE_DATABASE` bật, hệ thống tự tạo database `network_monitor` nếu chưa có. Dù database được tạo tự động hay có sẵn từ Workbench, server sẽ tạo các bảng ứng dụng còn thiếu:
-- **`clients`**: Lưu danh sách máy trạm (`client_key`, `name`, `ip`, `cpu`, `ram`, `disk`, `network`, `status`, `last_seen`, `registered_at`).
-- **`history`**: Lưu lịch sử biến động chỉ số tài nguyên (`client_key`, `cpu`, `ram`, `disk`, `network`, `timestamp`).
+- **`clients`**: Lưu danh sách máy trạm (`client_key`, `name`, `ip`, `cpu`, `ram`, `disk`, `network`, `upload_bytes_per_sec`, `download_bytes_per_sec`, `packets_sent`, `packets_recv`, `status`, `last_seen`, `registered_at`).
+- **`history`**: Lưu lịch sử biến động chỉ số tài nguyên và mạng (`client_key`, `cpu`, `ram`, `disk`, `network`, `upload_bytes_per_sec`, `download_bytes_per_sec`, `packets_sent`, `packets_recv`, `timestamp`).
+
+Khi server khởi động, các cột lưu lượng mạng mới được thêm theo cách bổ sung nếu thiếu; dữ liệu cũ và cột `network` hiện có được giữ nguyên. Lịch sử trước khi nâng cấp trả `null` cho các trường lưu lượng chưa từng được ghi.
 - **`alerts`**: Lưu nhật ký các cảnh báo vi phạm ngưỡng (`client_key`, `client_name`, `metric`, `value`, `limit_val`, `timestamp`).
 
 ---
@@ -199,13 +202,15 @@ Giao tiếp qua TCP sử dụng chuỗi ký tự UTF-8 phân tách bằng dấu 
 | Lệnh | Định dạng gửi từ Client | Phản hồi từ Server | Ý nghĩa |
 | :--- | :--- | :--- | :--- |
 | **REGISTER** | `REGISTER\|<client_name>\|<ip>\|<port>` hoặc thêm `\|PROCESS_LIST_V1` | `OK\|REGISTERED` | Đăng ký thiết bị; client mới quảng bá khả năng nhận yêu cầu danh sách tiến trình |
-| **SYSTEM** | `SYSTEM\|<client_name>\|CPU=<cpu>\|RAM=<ram>\|DISK=<disk>\|NETWORK=<net>` | `OK\|SYSTEM` | Cập nhật thông số tài nguyên thời gian thực |
+| **SYSTEM** | `SYSTEM\|<client_name>\|CPU=<cpu>\|RAM=<ram>\|DISK=<disk>\|NETWORK=<net>\|UPLOAD_BPS=<bytes_per_sec>\|DOWNLOAD_BPS=<bytes_per_sec>\|PACKETS_SENT=<count>\|PACKETS_RECV=<count>` | `OK\|SYSTEM` | Cập nhật tài nguyên và lưu lượng mạng; các trường mới có thể là `null` khi không khả dụng |
 | **HEARTBEAT**| `HEARTBEAT\|<client_name>` | `OK\|HEARTBEAT` hoặc `COMMAND\|GET_PROCESS_LIST\|<request_id>\|<limit>` | Duy trì trạng thái sống; nếu có yêu cầu đang chờ, server gửi lệnh cố định trên kết nối này |
 | **LOGOUT** | `LOGOUT\|<client_name>` | `OK\|LOGOUT` | Ngắt kết nối, chuyển trạng thái sang `OFFLINE` |
 | **PROCESS_LIST** | `PROCESS_LIST\|<client_name>\|<request_id>\|<JSON>` | `OK\|PROCESS_LIST` | Client trả tối đa 20 tiến trình với `pid`, `name`, `username`, `cpu_percent`, `memory_percent`, `status` |
 | **PROCESS_LIST_ERROR** | `PROCESS_LIST_ERROR\|<client_name>\|<request_id>\|UNAVAILABLE` | `OK\|PROCESS_LIST` | Client báo không thể thu thập thông tin tiến trình |
 
 ---
+
+`UPLOAD_BPS` và `DOWNLOAD_BPS` là tốc độ byte/giây tính từ chênh lệch bộ đếm và thời gian giữa hai lần đo; `PACKETS_SENT` và `PACKETS_RECV` là tổng bộ đếm gói tại lần đo hiện tại. Các giá trị là tổng hợp trên toàn máy, không tách theo giao diện mạng. Mẫu đầu tiên hoặc bộ đếm bị reset có tốc độ `0`; nếu bộ đếm không khả dụng, các trường mới được gửi là `null`. `NETWORK=<net>` vẫn được giữ để tương thích với server cũ; dashboard mới không dùng trường legacy này để biểu diễn thông lượng. Client cũ chỉ gửi các trường CPU/RAM/Disk/NETWORK vẫn được chấp nhận.
 
 Yêu cầu tiến trình chỉ được gửi tới client đã đăng ký và quảng bá `PROCESS_LIST_V1`; lệnh được giao ở heartbeat kế tiếp và hết hạn sau 30 giây. Server chỉ chấp nhận `GET_PROCESS_LIST`, không thực thi shell hay lệnh tùy ý. Request và kết quả được giữ trong bộ nhớ máy chủ, không lưu vào MySQL. Các endpoint yêu cầu tiến trình/kết quả dùng header `X-Admin-Token`; danh tính client hiện tại chỉ dựa trên tên đăng ký, chưa có xác thực mật mã cho client.
 
@@ -214,8 +219,8 @@ Yêu cầu tiến trình chỉ được gửi tới client đã đăng ký và q
 | Endpoint | Method | Mô tả |
 | :--- | :--- | :--- |
 | `/api/health` | GET | Kiểm tra trạng thái máy chủ và thông tin cổng đang lắng nghe |
-| `/api/clients` | GET | Danh sách toàn bộ các client, trạng thái Online/Offline và các thông số mới nhất |
-| `/api/clients/<name>/history` | GET | Lịch sử các mẫu đo gần nhất của một client cụ thể (lên tới 120 mẫu) |
+| `/api/clients` | GET | Danh sách client, trạng thái và metrics mới nhất, gồm `upload_bytes_per_sec`, `download_bytes_per_sec`, `packets_sent`, `packets_recv` |
+| `/api/clients/<name>/history` | GET | Lịch sử tối đa 120 mẫu, gồm tốc độ upload/download và bộ đếm gói nếu có |
 | `/api/alerts` | GET | Danh sách các cảnh báo vượt ngưỡng tài nguyên gần nhất |
 | `/api/clients/<name>/disconnect` | POST | Ngắt một client; yêu cầu header `X-Admin-Token: <MONITOR_ADMIN_TOKEN>` |
 | `/api/clients/<name>/process-list` | POST | Yêu cầu client gửi danh sách tối đa 20 tiến trình; cần admin token |
