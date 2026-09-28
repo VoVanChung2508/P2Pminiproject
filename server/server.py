@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hmac
+import logging
 import socket
 import threading
 import time
-import hmac
 from datetime import datetime
 from os import environ
 from typing import Any
@@ -16,10 +17,12 @@ HTTP_PORT = int(environ.get("MONITOR_HTTP_PORT", "8081"))
 TCP_HOST = "0.0.0.0"
 TCP_PORT = int(environ.get("MONITOR_TCP_PORT", "8888"))
 HEARTBEAT_TIMEOUT = 15
+TCP_CLIENT_TIMEOUT = 30
 SAMPLE_LIMIT = 120
 ADMIN_TOKEN = environ.get("MONITOR_ADMIN_TOKEN", "")
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
 state_lock = threading.RLock()
 clients: dict[str, dict[str, Any]] = {}
 disconnected_clients: set[str] = set()
@@ -185,24 +188,83 @@ def handle_message(message: str, address: tuple[str, int]) -> str:
 
 
 def tcp_client_session(connection: socket.socket, address: tuple[str, int]) -> None:
-    with connection:
-        connection.settimeout(30)
+    try:
+        connection.settimeout(TCP_CLIENT_TIMEOUT)
         buffer = ""
         while True:
             try:
                 data = connection.recv(4096)
             except socket.timeout:
-                continue
+                logger.warning(
+                    "TCP client session timed out from %s:%s; closing connection.",
+                    address[0],
+                    address[1],
+                )
+                break
+            except ConnectionResetError:
+                logger.info(
+                    "TCP client reset connection from %s:%s.",
+                    address[0],
+                    address[1],
+                )
+                break
             except OSError:
+                logger.exception(
+                    "TCP receive failed for client at %s:%s.",
+                    address[0],
+                    address[1],
+                )
                 return
             if not data:
-                return
+                logger.debug(
+                    "TCP client closed connection from %s:%s.",
+                    address[0],
+                    address[1],
+                )
+                break
             buffer += data.decode("utf-8", errors="replace")
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
                 if line.strip():
                     response = handle_message(line, address)
-                    connection.sendall((response + "\n").encode("utf-8"))
+                    try:
+                        connection.sendall((response + "\n").encode("utf-8"))
+                    except BrokenPipeError:
+                        logger.info(
+                            "TCP client closed before response could be sent to %s:%s.",
+                            address[0],
+                            address[1],
+                        )
+                        return
+                    except ConnectionResetError:
+                        logger.info(
+                            "TCP client reset connection while sending to %s:%s.",
+                            address[0],
+                            address[1],
+                        )
+                        return
+                    except OSError:
+                        logger.exception(
+                            "TCP send failed for client at %s:%s.",
+                            address[0],
+                            address[1],
+                        )
+                        return
+    except OSError:
+        logger.exception(
+            "TCP client session failed for client at %s:%s.",
+            address[0],
+            address[1],
+        )
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            logger.exception(
+                "Could not close TCP client connection from %s:%s.",
+                address[0],
+                address[1],
+            )
 
 
 def tcp_server() -> None:
@@ -212,10 +274,32 @@ def tcp_server() -> None:
         server_socket.listen(50)
         log(f"Monitoring TCP server listening on {TCP_PORT}")
         while True:
-            connection, address = server_socket.accept()
-            threading.Thread(
-                target=tcp_client_session, args=(connection, address), daemon=True
-            ).start()
+            try:
+                connection, address = server_socket.accept()
+            except OSError:
+                if server_socket.fileno() == -1:
+                    logger.info("TCP listener socket closed; stopping accept loop.")
+                else:
+                    logger.exception("TCP accept failed; stopping accept loop.")
+                break
+            try:
+                threading.Thread(
+                    target=tcp_client_session, args=(connection, address), daemon=True
+                ).start()
+            except Exception:
+                logger.exception(
+                    "Could not start TCP handler for client at %s:%s.",
+                    address[0],
+                    address[1],
+                )
+                try:
+                    connection.close()
+                except OSError:
+                    logger.exception(
+                        "Could not close unhandled TCP connection from %s:%s.",
+                        address[0],
+                        address[1],
+                    )
 
 
 def is_port_available(port: int, host: str = "0.0.0.0") -> bool:
@@ -426,12 +510,13 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
               <th>RAM</th>
               <th>Disk</th>
               <th>Network</th>
+              <th>Last Seen</th>
               <th>Trạng thái</th>
               <th>Thao tác</th>
             </tr>
           </thead>
           <tbody id="clients">
-            <tr><td colspan="8" class="empty">Đang kết nối tới máy chủ...</td></tr>
+            <tr><td colspan="9" class="empty">Đang kết nối tới máy chủ...</td></tr>
           </tbody>
         </table>
       </div>
@@ -455,6 +540,10 @@ const adminDisconnectEnabled = {{ 'true' if admin_disconnect_enabled else 'false
 const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
 }[char]));
+
+function renderLastSeen(value) {
+  return value == null || value === '' ? '—' : escapeHtml(value);
+}
 
 function renderMetric(val) {
   const num = parseFloat(val) || 0;
@@ -580,7 +669,7 @@ async function refresh() {
 
     const clientsTbody = document.getElementById('clients');
     if (clientsData.length === 0) {
-      clientsTbody.innerHTML = '<tr><td colspan="8" class="empty">Chưa có thiết bị nào đăng ký</td></tr>';
+      clientsTbody.innerHTML = '<tr><td colspan="9" class="empty">Chưa có thiết bị nào đăng ký</td></tr>';
       renderCharts([]);
     } else {
       clientsTbody.innerHTML = clientsData.map(c => `
@@ -591,6 +680,7 @@ async function refresh() {
           <td style="min-width:110px">${renderMetric(c.ram)}</td>
           <td style="min-width:110px">${renderMetric(c.disk)}</td>
           <td style="min-width:110px">${renderMetric(c.network)}</td>
+          <td>${renderLastSeen(c.last_seen)}</td>
           <td><span class="${c.status === 'ONLINE' ? 'online-tag' : 'offline-tag'}">${escapeHtml(c.status)}</span></td>
           <td><button class="disconnect-button" type="button" ${c.status !== 'ONLINE' || !adminDisconnectEnabled ? 'disabled' : ''}>Ngắt</button></td>
         </tr>

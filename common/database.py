@@ -2,6 +2,7 @@
 import os
 import logging
 import re
+import time
 from functools import wraps
 from threading import RLock
 from datetime import datetime
@@ -31,6 +32,9 @@ except ImportError:
 
 logger = logging.getLogger("DatabaseManager")
 T = TypeVar("T")
+MYSQL_RECONNECT_ATTEMPTS = 3
+MYSQL_RECONNECT_DELAY_SECONDS = 0.25
+TRANSIENT_MYSQL_ERRNOS = {1040, 1053, 1927, 2002, 2003, 2006, 2013, 2055}
 
 
 def _synchronized(method: Callable[..., T]) -> Callable[..., T]:
@@ -68,6 +72,8 @@ class DatabaseManager:
         self.db_conn = None
         self.is_connected = False
         self._lock = RLock()
+        self._needs_reconnect = False
+        self._last_connection_error: Optional[Exception] = None
 
     # ============================================================
     # CONNECT MYSQL
@@ -75,6 +81,34 @@ class DatabaseManager:
 
     @_synchronized
     def connect(self) -> bool:
+        self._discard_connection()
+        self._last_connection_error = None
+        for attempt in range(1, MYSQL_RECONNECT_ATTEMPTS + 1):
+            if self._connect_once():
+                self._needs_reconnect = False
+                return True
+
+            error = self._last_connection_error
+            if (
+                error is None
+                or not self._is_connection_error(error)
+                or attempt == MYSQL_RECONNECT_ATTEMPTS
+            ):
+                return False
+
+            logger.warning(
+                "MySQL connection attempt %s/%s failed (errno=%s); retrying.",
+                attempt,
+                MYSQL_RECONNECT_ATTEMPTS,
+                getattr(error, "errno", None),
+            )
+            time.sleep(MYSQL_RECONNECT_DELAY_SECONDS * attempt)
+            self._discard_connection(needs_reconnect=True)
+
+        return False
+
+    @_synchronized
+    def _connect_once(self) -> bool:
 
         if not MYSQL_AVAILABLE:
             logger.error(
@@ -157,40 +191,53 @@ class DatabaseManager:
 
         except mysql.connector.Error as e:
 
+            self._last_connection_error = e
             self.is_connected = False
+            self._needs_reconnect = self._is_connection_error(e)
             if self.db_conn is not None:
                 try:
                     self.db_conn.close()
                 except Exception as close_error:
-                    logger.error("Unable to close failed MySQL connection: %s", close_error)
+                    logger.error(
+                        "Unable to close failed MySQL connection (%s).",
+                        type(close_error).__name__,
+                    )
                 self.db_conn = None
 
             if e.errno == 1045:
                 logger.error(
-                    "MySQL authentication failed for user '%s'. Verify MYSQL_USER and "
+                    "MySQL authentication failed. Verify MYSQL_USER and "
                     "MYSQL_PASSWORD in the project's .env file or Windows environment "
                     "variables. Password values are not logged.",
-                    self.user,
                 )
             else:
                 logger.error(
-                    f"MySQL connection failed; server cannot persist data: {e}"
+                    "MySQL connection failed (errno=%s, sqlstate=%s); "
+                    "server cannot persist data.",
+                    getattr(e, "errno", None),
+                    getattr(e, "sqlstate", None),
                 )
 
             return False
 
         except Exception as e:
 
+            self._last_connection_error = e
             self.is_connected = False
+            self._needs_reconnect = False
             if self.db_conn is not None:
                 try:
                     self.db_conn.close()
                 except Exception as close_error:
-                    logger.error("Unable to close failed MySQL connection: %s", close_error)
+                    logger.error(
+                        "Unable to close failed MySQL connection (%s).",
+                        type(close_error).__name__,
+                    )
                 self.db_conn = None
 
             logger.error(
-                f"MySQL initialization failed; server cannot persist data: {e}"
+                "MySQL initialization failed (%s); server cannot persist data.",
+                type(e).__name__,
             )
 
             return False
@@ -199,12 +246,18 @@ class DatabaseManager:
                 try:
                     cursor.close()
                 except Exception as close_error:
-                    logger.error("Unable to close MySQL setup cursor: %s", close_error)
+                    logger.error(
+                        "Unable to close MySQL setup cursor (%s).",
+                        type(close_error).__name__,
+                    )
             if conn is not None:
                 try:
                     conn.close()
                 except Exception as close_error:
-                    logger.error("Unable to close MySQL setup connection: %s", close_error)
+                    logger.error(
+                        "Unable to close MySQL setup connection (%s).",
+                        type(close_error).__name__,
+                    )
 
     def _connect_existing_database(self) -> bool:
         try:
@@ -226,25 +279,30 @@ class DatabaseManager:
             )
             return True
         except Exception as error:
+            self._last_connection_error = error
             self.is_connected = False
+            self._needs_reconnect = self._is_connection_error(error)
             if self.db_conn is not None:
                 try:
                     self.db_conn.close()
                 except Exception as close_error:
-                    logger.error("Unable to close failed MySQL connection: %s", close_error)
+                    logger.error(
+                        "Unable to close failed MySQL connection (%s).",
+                        type(close_error).__name__,
+                    )
                 self.db_conn = None
             if getattr(error, "errno", None) == 1045:
                 logger.error(
-                    "MySQL authentication failed for user '%s'. Verify MYSQL_USER and "
+                    "MySQL authentication failed. Verify MYSQL_USER and "
                     "MYSQL_PASSWORD in the project's .env file or Windows environment "
                     "variables. Password values are not logged.",
-                    self.user,
                 )
             else:
                 logger.error(
-                    "Could not connect to existing MySQL database; persistent storage "
-                    "is unavailable: %s",
-                    error,
+                    "Could not connect to existing MySQL database (errno=%s, "
+                    "sqlstate=%s); persistent storage is unavailable.",
+                    getattr(error, "errno", None),
+                    getattr(error, "sqlstate", None),
                 )
             return False
 
@@ -386,20 +444,131 @@ class DatabaseManager:
     # CHECK CONNECTION
     # ============================================================
 
-    def _check_connection(self) -> bool:
-
-        if not self.is_connected or self.db_conn is None:
+    @staticmethod
+    def _is_connection_error(error: Exception) -> bool:
+        if getattr(error, "errno", None) == 1045:
             return False
-        return True
+        if getattr(error, "errno", None) in TRANSIENT_MYSQL_ERRNOS:
+            return True
+        if not MYSQL_AVAILABLE:
+            return False
+        interface_error = getattr(mysql.connector, "InterfaceError", ())
+        operational_error = getattr(mysql.connector, "OperationalError", ())
+        return (
+            isinstance(error, interface_error)
+            or (
+                getattr(error, "errno", None) is None
+                and isinstance(error, operational_error)
+            )
+        )
+
+    @staticmethod
+    def _log_connection_error(error: Exception) -> None:
+        if getattr(error, "errno", None) == 1045:
+            logger.error(
+                "MySQL authentication failed. Verify MYSQL_USER and MYSQL_PASSWORD "
+                "in the project environment. Secret values are not logged."
+            )
+            return
+        logger.error(
+            "MySQL connection failed (errno=%s, sqlstate=%s, type=%s); "
+            "persistent storage is unavailable.",
+            getattr(error, "errno", None),
+            getattr(error, "sqlstate", None),
+            type(error).__name__,
+        )
+
+    def _discard_connection(self, needs_reconnect: bool = False) -> None:
+        connection = self.db_conn
+        self.db_conn = None
+        self.is_connected = False
+        self._needs_reconnect = needs_reconnect
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception as error:
+                logger.warning(
+                    "Could not close MySQL connection (%s).",
+                    type(error).__name__,
+                )
+
+    def _check_connection(self) -> bool:
+        if not MYSQL_AVAILABLE:
+            return False
+        if not self.is_connected or self.db_conn is None:
+            if self._needs_reconnect:
+                return self.connect()
+            return False
+
+        cursor = None
+        health_error = None
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+            # The connection disables autocommit; end the health-check read transaction.
+            self.db_conn.rollback()
+        except Exception as error:
+            health_error = error
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception as error:
+                    logger.warning(
+                        "MySQL health-check cursor close failed (%s).",
+                        type(error).__name__,
+                    )
+
+        if health_error is None:
+            return True
+
+        logger.warning(
+            "MySQL SELECT 1 health check failed (errno=%s, sqlstate=%s, type=%s); "
+            "reconnecting.",
+            getattr(health_error, "errno", None),
+            getattr(health_error, "sqlstate", None),
+            type(health_error).__name__,
+        )
+        self._handle_operation_error("connection health check", health_error)
+        return self.is_connected
 
     def _handle_operation_error(self, operation: str, error: Exception) -> None:
-        self.is_connected = False
+        connection_failed = self._is_connection_error(error)
+        rollback_failed = False
         if self.db_conn is not None:
             try:
                 self.db_conn.rollback()
             except Exception as rollback_error:
-                logger.error("MySQL rollback after %s failed: %s", operation, rollback_error)
-        logger.error("MySQL %s failed; persistent storage is unavailable: %s", operation, error)
+                logger.error(
+                    "MySQL rollback after %s failed (%s).",
+                    operation,
+                    type(rollback_error).__name__,
+                )
+                rollback_failed = True
+                connection_failed = True
+
+        if connection_failed:
+            logger.error(
+                "MySQL %s failed due to a connection error (errno=%s, sqlstate=%s, "
+                "type=%s); the operation will not be replayed.",
+                operation,
+                getattr(error, "errno", None),
+                getattr(error, "sqlstate", None),
+                type(error).__name__,
+            )
+            self._discard_connection(needs_reconnect=True)
+            self.connect()
+            return
+
+        self._discard_connection(needs_reconnect=rollback_failed)
+        logger.error(
+            "MySQL %s failed (%s); transaction was rolled back when possible.",
+            operation,
+            type(error).__name__,
+        )
+        if rollback_failed:
+            self.connect()
 
     def _close_cursor(self, cursor: Any) -> None:
         if cursor is None:
@@ -407,8 +576,12 @@ class DatabaseManager:
         try:
             cursor.close()
         except Exception as error:
-            self.is_connected = False
-            logger.error("MySQL cursor close failed; persistent storage is unavailable: %s", error)
+            logger.error(
+                "MySQL cursor close failed (%s).",
+                type(error).__name__,
+            )
+            if self._is_connection_error(error):
+                self._handle_operation_error("cursor close", error)
 
     # ============================================================
     # REGISTER CLIENT
@@ -791,18 +964,29 @@ class DatabaseManager:
             self._close_cursor(cursor)
 
     def _read_rows(self, operation: str, query: str, parameters: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
-        if not self._check_connection():
-            raise RuntimeError("MySQL is unavailable; persistent data cannot be read.")
-        cursor = None
-        try:
-            cursor = self.db_conn.cursor()
-            cursor.execute(query, parameters)
-            return list(cursor.fetchall())
-        except Exception as error:
-            self._handle_operation_error(operation, error)
-            raise RuntimeError(f"MySQL {operation} failed; persistent data cannot be read.") from error
-        finally:
-            self._close_cursor(cursor)
+        for attempt in range(2):
+            if not self._check_connection():
+                raise RuntimeError(
+                    "MySQL is unavailable; persistent data cannot be read."
+                )
+            cursor = None
+            try:
+                cursor = self.db_conn.cursor()
+                cursor.execute(query, parameters)
+                return list(cursor.fetchall())
+            except Exception as error:
+                can_retry = attempt == 0 and self._is_connection_error(error)
+                self._handle_operation_error(operation, error)
+                if can_retry and self.is_connected:
+                    continue
+                raise RuntimeError(
+                    f"MySQL {operation} failed; persistent data cannot be read."
+                ) from error
+            finally:
+                self._close_cursor(cursor)
+        raise RuntimeError(
+            "MySQL is unavailable; persistent data cannot be read."
+        )
 
     @staticmethod
     def _format_datetime(value: Any) -> Optional[str]:
@@ -894,24 +1078,8 @@ class DatabaseManager:
 
     @_synchronized
     def close(self) -> None:
-
-        if self.db_conn is not None:
-
-            try:
-
-                self.db_conn.close()
-
-            except Exception as e:
-
-                logger.error(
-                    f"Lỗi đóng MySQL connection: {e}"
-                )
-
-            finally:
-
-                self.db_conn = None
-                self.is_connected = False
-
-                logger.info(
-                    "MySQL connection đã đóng."
-                )
+        connection_was_open = self.db_conn is not None
+        self._discard_connection()
+        self._last_connection_error = None
+        if connection_was_open:
+            logger.info("MySQL connection đã đóng.")
