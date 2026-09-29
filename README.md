@@ -36,8 +36,9 @@ flowchart LR
 - Theo dõi tốc độ tải lên/tải xuống mạng và bộ đếm gói tin.
 - Lưu trạng thái máy khách, lịch sử chỉ số và cảnh báo ngưỡng vào MySQL.
 - Bảng điều khiển Flask hiển thị trạng thái máy khách, thời điểm hoạt động gần nhất, tốc độ mạng, lịch sử và cảnh báo.
-- Thu thập tối đa 50 tiến trình; cửa sổ tiến trình trong GUI Tkinter và bảng điều khiển web tự làm mới mỗi 10 giây, đồng thời hiển thị thời điểm cập nhật thành công gần nhất.
-- Người quản trị có thể tìm kiếm, lọc, sắp xếp và yêu cầu kết thúc tiến trình từ GUI Tkinter hoặc bảng điều khiển web; khi lần làm mới thất bại, giao diện giữ snapshot thành công gần nhất và báo trạng thái lỗi.
+- Cửa sổ tiến trình trong GUI Tkinter hiển thị tối đa 50 tiến trình; bảng điều khiển web nhận snapshot đầy đủ có giới hạn tối đa 1.000 tiến trình. Cả hai tự làm mới mỗi 10 giây và hiển thị thời điểm cập nhật thành công gần nhất.
+- Bảng điều khiển so sánh các snapshot thành công cho từng client, đánh dấu tiến trình mới/đang chạy, hiển thị lịch sử STARTED/STOPPED gần đây và giữ nguyên dữ liệu gần nhất khi collection thất bại. MySQL chỉ lưu sự kiện và giữ tối đa 500 sự kiện gần nhất cho mỗi client.
+- Người quản trị có thể tìm kiếm, lọc, sắp xếp và yêu cầu kết thúc tiến trình từ GUI Tkinter hoặc bảng điều khiển web; việc kết thúc từ xa được ghi nhận là STOPPED sau snapshot hợp lệ tiếp theo.
 - Lệnh quản lý tiến trình dùng HMAC-SHA256 với `MONITOR_ADMIN_TOKEN`, chỉ chấp nhận PID hợp lệ và từ chối tiến trình hệ thống/tiến trình agent được bảo vệ; các yêu cầu kết thúc được ghi vào nhật ký và bảng audit MySQL.
 - Có GUI và CLI cho máy khách, cùng GUI quản lý máy chủ.
 - Ghi nhật ký ra console và tệp luân phiên, hỗ trợ cấu hình mức nhật ký và che giấu bí mật.
@@ -118,7 +119,7 @@ python client/monitoring_client.py PC01 --cli --host 127.0.0.1 --port 8888 --int
 
 Nếu dùng cổng HTTP mặc định, mở <http://localhost:8081>. Máy chủ yêu cầu MySQL; nếu MySQL không khả dụng, tiến trình sẽ thoát thay vì chuyển sang lưu trữ trong bộ nhớ.
 
-Để xem tiến trình, chọn máy khách đang trực tuyến trong GUI/bảng điều khiển rồi mở phần tiến trình. Danh sách được tải ngay và tự làm mới mỗi 10 giây; mỗi phản hồi chứa tối đa 50 tiến trình do máy khách báo cáo. Giao diện hiển thị thời điểm cập nhật thành công gần nhất và giữ dữ liệu đó nếu lần làm mới tiếp theo không thành công.
+Để xem tiến trình, chọn máy khách đang trực tuyến trong GUI/bảng điều khiển rồi mở phần tiến trình. Danh sách được tải ngay và tự làm mới mỗi 10 giây. Lệnh danh sách cũ của GUI giới hạn ở 50 tiến trình; snapshot có giới hạn dùng cho bảng điều khiển web nhận tối đa 1.000 tiến trình để so sánh hoạt động. Bảng điều khiển hiển thị sự kiện NEW/STOPPED và trạng thái Process Monitoring; khi collection thất bại hoặc snapshot vượt giới hạn, dữ liệu hiện tại được giữ nguyên và thời điểm cập nhật thành công cuối cùng vẫn hiển thị.
 
 ## 8. Cấu hình
 

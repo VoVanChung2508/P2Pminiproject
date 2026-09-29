@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import platform
 from typing import Any
@@ -13,6 +14,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 TOP_N = 50
+MAX_PROCESS_SNAPSHOT_COUNT = 1000
+MAX_PROCESS_SNAPSHOT_PAYLOAD_BYTES = 262144
 PROCESS_FIELDS = frozenset(
     {"pid", "name", "username", "cpu_percent", "memory_percent", "status"}
 )
@@ -36,10 +39,30 @@ PROTECTED_PROCESSES = {
 def collect_process_list(limit: int = TOP_N) -> list[dict[str, Any]]:
     if not 1 <= limit <= TOP_N:
         raise ValueError(f"Process list limit must be between 1 and {TOP_N}.")
+    return _collect_process_records()[:limit]
+
+
+def collect_process_snapshot() -> list[dict[str, Any]]:
+    processes = _collect_process_records(
+        max_count=MAX_PROCESS_SNAPSHOT_COUNT,
+        require_complete=True,
+    )
+    payload_size = len(json.dumps(processes, separators=(",", ":")).encode("utf-8"))
+    if payload_size > MAX_PROCESS_SNAPSHOT_PAYLOAD_BYTES:
+        raise RuntimeError("Process snapshot exceeds the supported payload size.")
+    return processes
+
+
+def _collect_process_records(
+    *,
+    max_count: int | None = None,
+    require_complete: bool = False,
+) -> list[dict[str, Any]]:
     if psutil is None:
         raise RuntimeError("psutil is unavailable; process monitoring is disabled.")
 
     processes: list[dict[str, Any]] = []
+    incomplete = False
     try:
         process_iter = psutil.process_iter(
             attrs=["pid", "name", "username", "cpu_percent", "memory_percent", "status"],
@@ -50,7 +73,25 @@ def collect_process_list(limit: int = TOP_N) -> list[dict[str, Any]]:
                 info = process.info
                 pid = info.get("pid")
                 name = info.get("name")
-                if not isinstance(pid, int) or not isinstance(name, str) or not name:
+                if isinstance(pid, int) and not isinstance(pid, bool) and pid <= 0:
+                    continue
+                if (
+                    not isinstance(pid, int)
+                    or isinstance(pid, bool)
+                    or not isinstance(name, str)
+                    or not name
+                ):
+                    if (
+                        require_complete
+                        and not (
+                            isinstance(pid, int)
+                            and not isinstance(pid, bool)
+                            and info.get("status")
+                            == getattr(psutil, "STATUS_STOPPED", "stopped")
+                            and not name
+                        )
+                    ):
+                        incomplete = True
                     continue
                 processes.append(
                     {
@@ -76,17 +117,24 @@ def collect_process_list(limit: int = TOP_N) -> list[dict[str, Any]]:
                 continue
             except psutil.AccessDenied:
                 logger.info("Skipping process whose details are not accessible.")
+                incomplete = True
             except OSError as error:
                 logger.warning(
                     "Skipping process after operating-system error (%s).",
                     type(error).__name__,
                 )
+                incomplete = True
     except psutil.Error as error:
         logger.error(
             "Process enumeration failed (%s).",
             type(error).__name__,
         )
         raise RuntimeError("Could not enumerate process information.") from error
+
+    if require_complete and incomplete:
+        raise RuntimeError("Process enumeration returned an incomplete snapshot.")
+    if max_count is not None and len(processes) > max_count:
+        raise RuntimeError("Process snapshot exceeds the supported process count.")
 
     processes.sort(
         key=lambda item: (
@@ -96,7 +144,7 @@ def collect_process_list(limit: int = TOP_N) -> list[dict[str, Any]]:
         ),
         reverse=True,
     )
-    return processes[:limit]
+    return processes
 
 
 def _bounded_percentage(value: Any) -> float | None:

@@ -35,6 +35,7 @@ T = TypeVar("T")
 MYSQL_RECONNECT_ATTEMPTS = 3
 MYSQL_RECONNECT_DELAY_SECONDS = 0.25
 TRANSIENT_MYSQL_ERRNOS = {1040, 1053, 1927, 2002, 2003, 2006, 2013, 2055}
+PROCESS_ACTIVITY_HISTORY_LIMIT = 500
 
 
 def _synchronized(method: Callable[..., T]) -> Callable[..., T]:
@@ -473,6 +474,39 @@ class DatabaseManager:
 
                     INDEX idx_process_audit_client_time
                     (client_key, requested_at)
+
+                )
+                ENGINE=InnoDB
+                DEFAULT CHARSET=utf8mb4;
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS process_activity (
+
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+                    client_key VARCHAR(100)
+                        NOT NULL,
+
+                    client_name VARCHAR(100)
+                        NOT NULL,
+
+                    pid BIGINT UNSIGNED
+                        NOT NULL,
+
+                    process_name VARCHAR(256)
+                        NOT NULL,
+
+                    event_type VARCHAR(16)
+                        NOT NULL,
+
+                    timestamp DATETIME
+                        NOT NULL,
+
+                    INDEX idx_process_activity_client_time
+                    (client_key, timestamp, id)
 
                 )
                 ENGINE=InnoDB
@@ -984,6 +1018,115 @@ class DatabaseManager:
 
         finally:
             self._close_cursor(cursor)
+
+    @_synchronized
+    def record_process_activity(
+        self,
+        client_name: str,
+        events: list[Dict[str, Any]],
+    ) -> bool:
+        if not events:
+            return True
+        if not self._check_connection():
+            return False
+
+        for event in events:
+            if (
+                not isinstance(event, dict)
+                or set(event) != {"pid", "name", "event_type"}
+                or type(event.get("pid")) is not int
+                or not 1 <= event["pid"] <= 4_294_967_295
+                or not isinstance(event.get("name"), str)
+                or not event["name"]
+                or len(event["name"]) > 256
+                or not isinstance(event.get("event_type"), str)
+                or event.get("event_type") not in {"STARTED", "STOPPED"}
+            ):
+                raise ValueError("Process activity event is invalid.")
+
+        key = client_name.lower()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor = None
+        try:
+            cursor = self.db_conn.cursor()
+            for event in events:
+                cursor.execute(
+                    """
+                    INSERT INTO process_activity
+                    (
+                        client_key,
+                        client_name,
+                        pid,
+                        process_name,
+                        event_type,
+                        timestamp
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        key,
+                        client_name,
+                        event["pid"],
+                        event["name"],
+                        event["event_type"],
+                        timestamp,
+                    ),
+                )
+            cursor.execute(
+                """
+                DELETE FROM process_activity
+                WHERE client_key = %s
+                  AND id NOT IN (
+                      SELECT id FROM (
+                          SELECT id
+                          FROM process_activity
+                          WHERE client_key = %s
+                          ORDER BY timestamp DESC, id DESC
+                          LIMIT %s
+                      ) AS retained_activity
+                  )
+                """,
+                (key, key, PROCESS_ACTIVITY_HISTORY_LIMIT),
+            )
+            self.db_conn.commit()
+            return True
+        except Exception as error:
+            self._handle_operation_error("record_process_activity", error)
+            return False
+        finally:
+            self._close_cursor(cursor)
+
+    @_synchronized
+    def get_process_activity(
+        self,
+        client_name: str,
+        limit: int = 50,
+    ) -> list[Dict[str, Any]]:
+        if not 1 <= limit <= PROCESS_ACTIVITY_HISTORY_LIMIT:
+            raise ValueError(
+                "Process activity limit must be between 1 and "
+                f"{PROCESS_ACTIVITY_HISTORY_LIMIT}."
+            )
+        rows = self._read_rows(
+            "get_process_activity",
+            """
+            SELECT pid, process_name, event_type, timestamp
+            FROM process_activity
+            WHERE client_key = %s
+            ORDER BY timestamp DESC, id DESC
+            LIMIT %s
+            """,
+            (client_name.lower(), limit),
+        )
+        return [
+            {
+                "pid": int(row[0]),
+                "process_name": row[1],
+                "event_type": row[2],
+                "timestamp": self._format_datetime(row[3]),
+            }
+            for row in rows
+        ]
 
     @_synchronized
     def add_process_termination_audit(

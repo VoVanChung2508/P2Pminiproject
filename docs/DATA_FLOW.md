@@ -195,13 +195,17 @@ tham số cho các giá trị trong câu lệnh SQL.
 | Yêu cầu danh sách máy khách từ bảng điều khiển | `SELECT` các hàng máy khách | `clients` |
 | Yêu cầu lịch sử từ bảng điều khiển | `SELECT` các mẫu có giới hạn, sắp xếp theo thứ tự | `history` |
 | Yêu cầu cảnh báo từ bảng điều khiển | `SELECT` các hàng cảnh báo gần nhất trong giới hạn | `alerts` |
+| Snapshot tiến trình hợp lệ | So sánh snapshot trước/sau theo PID trong phạm vi client; chèn STARTED/STOPPED và xóa sự kiện cũ vượt quá 500 hàng/client | `process_activity` |
+| Yêu cầu hoạt động tiến trình từ bảng điều khiển | `SELECT` các sự kiện mới nhất trong giới hạn | `process_activity` |
 | Yêu cầu kết thúc tiến trình | Chèn yêu cầu audit rồi cập nhật kết quả/timeout | `process_termination_audit` |
 
 Việc cập nhật hàng hiện tại của chỉ số và chèn lịch sử được commit cùng nhau.
 Việc chèn cảnh báo diễn ra sau đó như một thao tác/commit riêng. Dấu thời gian
 heartbeat trong thời gian chạy, khả năng, dấu ngắt kết nối và trạng thái lệnh
-đang chờ được lưu trong bộ nhớ, không phải bản ghi bền vững trong cơ sở dữ
-liệu.
+đang chờ và snapshot tiến trình mới nhất được lưu trong bộ nhớ, không phải bản
+ghi bền vững trong cơ sở dữ liệu. Một collection thất bại chỉ đổi trạng thái
+monitoring thành UNAVAILABLE; nó không làm mất snapshot gần nhất hoặc tạo sự
+kiện STOPPED. Snapshot hợp lệ đầu tiên chỉ thiết lập baseline.
 
 ## 8. Luồng ngắt kết nối
 
@@ -300,13 +304,22 @@ công vào MySQL.
    trong khung TCP.
 4. `client/tcp_client.py` xác minh chữ ký bằng biến môi trường
    `MONITOR_ADMIN_TOKEN`, từ chối chữ ký không hợp lệ hoặc request ID đã xử lý,
-   rồi gọi `collect_process_list()` hoặc `terminate_process()`. Helper kết
-   thúc từ chối PID không hợp lệ, tiến trình hệ thống/agent được bảo vệ,
-   tiến trình đã dừng hoặc thao tác bị hệ điều hành từ chối.
+   rồi gọi `collect_process_list()` cho danh sách GUI giới hạn 50 tiến trình,
+   `collect_process_snapshot()` cho snapshot dashboard giới hạn 1.000 tiến
+   trình hoặc `terminate_process()`. Snapshot dashboard vượt giới hạn, quá
+   lớn hoặc không đầy đủ được báo là không khả dụng. Helper kết thúc từ chối
+   PID không hợp lệ, tiến trình hệ thống/agent được bảo vệ, tiến trình đã dừng
+   hoặc thao tác bị hệ điều hành từ chối.
 5. Máy khách trả kết quả qua TCP. Máy chủ kiểm tra peer, request ID và schema
    trước khi hoàn tất yêu cầu; kết quả hoặc timeout cập nhật bản ghi audit.
    Giao diện hiển thị lỗi và tải lại danh sách sau khi kết thúc thành công để
    xác minh PID đã biến mất.
+
+Dashboard yêu cầu snapshot theo chu kỳ 10 giây, so sánh snapshot thành công
+gần nhất của đúng máy khách theo PID và tên tiến trình, rồi hiển thị danh sách
+hiện tại cùng sự kiện STARTED/STOPPED mới nhất. Snapshot thành công đầu tiên
+chỉ tạo baseline; snapshot không đầy đủ hoặc không khả dụng giữ nguyên danh
+sách gần nhất và không được diễn giải thành việc mọi tiến trình đã dừng.
 
 HMAC xác thực và bảo vệ tính toàn vẹn lệnh nhưng không mã hóa TCP, cũng không
 xác thực kết nối máy khách thông thường. Cần cấu hình cùng một khóa ngẫu

@@ -771,16 +771,20 @@ class ProcessMonitoringTests(unittest.TestCase):
         self.previous_controlled_requests = copy.deepcopy(
             server.controlled_command_requests
         )
+        self.previous_process_snapshots = copy.deepcopy(server.process_snapshots)
         server.ADMIN_TOKEN = "test-process-admin-token"
         server.clients.clear()
         server.disconnected_clients.clear()
         server.process_requests.clear()
         server.controlled_command_requests.clear()
+        server.process_snapshots.clear()
 
         self.database_patches = (
             patch.object(server.db_manager, "register_client", return_value=True),
             patch.object(server.db_manager, "update_heartbeat", return_value=True),
             patch.object(server.db_manager, "update_status", return_value=True),
+            patch.object(server.db_manager, "record_process_activity", return_value=True),
+            patch.object(server.db_manager, "get_process_activity", return_value=[]),
         )
         for active_patch in self.database_patches:
             active_patch.start()
@@ -797,6 +801,8 @@ class ProcessMonitoringTests(unittest.TestCase):
         server.process_requests.update(self.previous_process_requests)
         server.controlled_command_requests.clear()
         server.controlled_command_requests.update(self.previous_controlled_requests)
+        server.process_snapshots.clear()
+        server.process_snapshots.update(self.previous_process_snapshots)
 
     def register(self, name: str, *, capable: bool = True) -> None:
         capability = f"|{server.PROCESS_LIST_CAPABILITY}" if capable else ""
@@ -1653,6 +1659,85 @@ class ProcessCollectorTests(unittest.TestCase):
         with patch.object(process_monitor, "psutil", None):
             with self.assertRaises(RuntimeError):
                 process_monitor.collect_process_list()
+            with self.assertRaises(RuntimeError):
+                process_monitor.collect_process_snapshot()
+
+    def test_process_snapshot_includes_processes_beyond_legacy_top_n(self) -> None:
+        class FakeProcess:
+            def __init__(self, pid: int):
+                self.info = {
+                    "pid": pid,
+                    "name": f"process-{pid}.exe",
+                    "username": "monitor",
+                    "cpu_percent": 0.1,
+                    "memory_percent": 0.1,
+                    "status": "running",
+                }
+
+        class FakePsutil:
+            Error = RuntimeError
+            NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+            ZombieProcess = type("ZombieProcess", (NoSuchProcess,), {})
+            AccessDenied = type("AccessDenied", (Exception,), {})
+
+            @staticmethod
+            def process_iter(*, attrs, ad_value):
+                assert "pid" in attrs and "name" in attrs and ad_value is None
+                return [FakeProcess(0), *(FakeProcess(pid) for pid in range(1, 76))]
+
+        with patch.object(process_monitor, "psutil", FakePsutil):
+            snapshot = process_monitor.collect_process_snapshot()
+            legacy_list = process_monitor.collect_process_list()
+
+        self.assertEqual(len(snapshot), 75)
+        self.assertEqual(len(legacy_list), process_monitor.TOP_N)
+        self.assertIn(75, {process["pid"] for process in snapshot})
+        self.assertNotIn(0, {process["pid"] for process in snapshot})
+
+    def test_process_snapshot_skips_stale_stopped_entries_only(self) -> None:
+        records = []
+
+        class FakeProcess:
+            def __init__(self, info):
+                self.info = info
+
+        class FakePsutil:
+            Error = RuntimeError
+            NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+            ZombieProcess = type("ZombieProcess", (NoSuchProcess,), {})
+            AccessDenied = type("AccessDenied", (Exception,), {})
+            STATUS_STOPPED = "stopped"
+
+            @staticmethod
+            def process_iter(*, attrs, ad_value):
+                assert "pid" in attrs and "name" in attrs and ad_value is None
+                return [FakeProcess(record) for record in records]
+
+        with patch.object(process_monitor, "psutil", FakePsutil):
+            records.append(
+                {
+                    "pid": 100,
+                    "name": "",
+                    "username": None,
+                    "cpu_percent": None,
+                    "memory_percent": None,
+                    "status": "stopped",
+                }
+            )
+            self.assertEqual(process_monitor.collect_process_snapshot(), [])
+
+            records[:] = [
+                {
+                    "pid": 101,
+                    "name": "",
+                    "username": None,
+                    "cpu_percent": None,
+                    "memory_percent": None,
+                    "status": "running",
+                }
+            ]
+            with self.assertRaisesRegex(RuntimeError, "incomplete snapshot"):
+                process_monitor.collect_process_snapshot()
 
 
 @unittest.skipUnless(
@@ -1836,6 +1921,51 @@ class DatabaseStrictStorageTests(unittest.TestCase):
         self.assertFalse(manager.add_alert("node-01", "cpu", 90.0, 80.0))
         self.assertFalse(manager.update_status("node-01", "OFFLINE"))
 
+    def test_process_activity_writes_events_and_caps_history_per_client(self) -> None:
+        manager = database.DatabaseManager()
+        manager.db_conn = Mock()
+        manager.is_connected = True
+        events = [
+            {"pid": 1234, "name": "notepad.exe", "event_type": "STARTED"},
+            {"pid": 8912, "name": "spotify.exe", "event_type": "STOPPED"},
+        ]
+
+        with patch.object(manager, "_check_connection", return_value=True):
+            self.assertTrue(manager.record_process_activity("PC-01", events))
+
+        statements = [
+            call.args[0]
+            for call in manager.db_conn.cursor.return_value.execute.call_args_list
+        ]
+        self.assertEqual(sum("INSERT INTO process_activity" in sql for sql in statements), 2)
+        retention_query = next(sql for sql in statements if "DELETE FROM process_activity" in sql)
+        self.assertIn("WHERE client_key = %s", retention_query)
+        self.assertIn(str(database.PROCESS_ACTIVITY_HISTORY_LIMIT), str(
+            manager.db_conn.cursor.return_value.execute.call_args_list[-1].args[1]
+        ))
+        manager.db_conn.commit.assert_called_once_with()
+
+    def test_process_activity_reader_normalizes_recent_event_rows(self) -> None:
+        manager = database.DatabaseManager()
+        event_time = database.datetime(2026, 9, 29, 8, 52, 31)
+        with patch.object(
+            manager,
+            "_read_rows",
+            return_value=[(1234, "notepad.exe", "STARTED", event_time)],
+        ) as read_rows:
+            events = manager.get_process_activity("PC-01", 50)
+
+        self.assertEqual(
+            events,
+            [{
+                "pid": 1234,
+                "process_name": "notepad.exe",
+                "event_type": "STARTED",
+                "timestamp": "2026-09-29T08:52:31",
+            }],
+        )
+        self.assertEqual(read_rows.call_args.args[2], ("pc-01", 50))
+
     def test_mysql_connection_uses_configured_credentials(self) -> None:
         manager = database.DatabaseManager(
             host="db.example",
@@ -2010,6 +2140,12 @@ class DatabaseStrictStorageTests(unittest.TestCase):
             if call.args[0].startswith("ALTER TABLE")
         ]
         self.assertEqual(len(alters), 8)
+        self.assertTrue(
+            any(
+                "CREATE TABLE IF NOT EXISTS process_activity" in call.args[0]
+                for call in cursor.execute.call_args_list
+            )
+        )
         self.assertTrue(any("clients` ADD COLUMN `upload_bytes_per_sec`" in query for query in alters))
         self.assertTrue(any("history` ADD COLUMN `download_bytes_per_sec`" in query for query in alters))
         self.assertTrue(any("packets_sent` BIGINT UNSIGNED NULL" in query for query in alters))

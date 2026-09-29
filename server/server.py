@@ -40,12 +40,14 @@ CONTROLLED_COMMANDS = frozenset(
 PROCESS_MANAGEMENT_COMMANDS = frozenset({"GET_PROCESSES", "TERMINATE_PROCESS"})
 MAX_REMOTE_PROCESS_PID = 4_294_967_295
 PROCESS_LIST_TOP_N = 50
+PROCESS_SNAPSHOT_MAX_COUNT = 1000
 PROCESS_LIST_REQUEST_TIMEOUT_SECONDS = 30
-PROCESS_LIST_MAX_PAYLOAD_BYTES = 65536
+PROCESS_LIST_MAX_PAYLOAD_BYTES = 262144
 PROCESS_LIST_MAX_TCP_FRAME_BYTES = PROCESS_LIST_MAX_PAYLOAD_BYTES + 512
 PROCESS_LIST_MAX_TRACKED_CLIENTS = 1000
 PROCESS_LIST_RESULT_RETENTION_SECONDS = 300
 CONTROLLED_COMMAND_REQUEST_TIMEOUT_SECONDS = 15
+PROCESS_ACTIVITY_API_LIMIT = 50
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
@@ -196,6 +198,102 @@ def _prune_process_requests_locked(now: float) -> None:
             del process_requests[client_key]
 
 
+def _mark_process_monitoring_unavailable_locked(client_key: str) -> None:
+    snapshot = process_snapshots.get(client_key)
+    if snapshot is None:
+        client = clients.get(client_key, {})
+        snapshot = {
+            "client": client.get("name", client_key),
+            "processes": None,
+            "updated_at": None,
+            "request_id": None,
+        }
+        process_snapshots[client_key] = snapshot
+    snapshot["monitoring_status"] = "UNAVAILABLE"
+    snapshot["failed_at"] = time.time()
+
+
+def _diff_process_snapshots(
+    previous: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    previous_by_pid = {process["pid"]: process for process in previous}
+    current_by_pid = {process["pid"]: process for process in current}
+    events = []
+
+    for pid in sorted(previous_by_pid.keys() | current_by_pid.keys()):
+        old_process = previous_by_pid.get(pid)
+        new_process = current_by_pid.get(pid)
+        if old_process and (
+            new_process is None or old_process["name"] != new_process["name"]
+        ):
+            events.append(
+                {
+                    "pid": pid,
+                    "name": old_process["name"],
+                    "event_type": "STOPPED",
+                }
+            )
+        if new_process and (
+            old_process is None or old_process["name"] != new_process["name"]
+        ):
+            events.append(
+                {
+                    "pid": pid,
+                    "name": new_process["name"],
+                    "event_type": "STARTED",
+                }
+            )
+    return events
+
+
+def _store_process_snapshot_locked(
+    client_key: str,
+    client_name: str,
+    processes: list[dict[str, Any]],
+    updated_at: float,
+    request_id: str,
+) -> bool:
+    snapshot = process_snapshots.get(client_key)
+    has_previous_snapshot = (
+        snapshot is not None
+        and isinstance(snapshot.get("processes"), list)
+        and snapshot.get("updated_at") is not None
+    )
+    previous = (
+        snapshot["processes"]
+        if has_previous_snapshot and snapshot is not None
+        else []
+    )
+    events = _diff_process_snapshots(previous, processes) if has_previous_snapshot else []
+    if events and not db_manager.record_process_activity(client_name, events):
+        _mark_process_monitoring_unavailable_locked(client_key)
+        return False
+
+    previous_by_pid = {process["pid"]: process for process in previous}
+    current_processes = []
+    for process in processes:
+        current_process = dict(process)
+        old_process = previous_by_pid.get(process["pid"])
+        current_process["activity_status"] = (
+            "RUNNING"
+            if not has_previous_snapshot
+            or (old_process is not None and old_process["name"] == process["name"])
+            else "NEW"
+        )
+        current_processes.append(current_process)
+
+    process_snapshots[client_key] = {
+        "client": client_name,
+        "processes": current_processes,
+        "updated_at": updated_at,
+        "last_successful_update": updated_at,
+        "request_id": request_id,
+        "monitoring_status": "AVAILABLE",
+    }
+    return True
+
+
 def _expire_controlled_command_locked(client_key: str) -> None:
     command_request = controlled_command_requests.get(client_key)
     if (
@@ -206,6 +304,8 @@ def _expire_controlled_command_locked(client_key: str) -> None:
         command_request["status"] = "timeout"
         command_request["result"] = None
         command_request["completed_at"] = time.time()
+        if command_request.get("command") == "GET_PROCESSES":
+            _mark_process_monitoring_unavailable_locked(client_key)
 
 
 def _prune_controlled_commands_locked(now: float) -> None:
@@ -217,6 +317,8 @@ def _prune_controlled_commands_locked(now: float) -> None:
             command_request["status"] = "timeout"
             command_request["result"] = None
             command_request["completed_at"] = time.time()
+            if command_request.get("command") == "GET_PROCESSES":
+                _mark_process_monitoring_unavailable_locked(client_key)
         elif (
             command_request["status"] not in {"pending", "delivered"}
             and now
@@ -357,8 +459,10 @@ def _validate_controlled_command_result(
         return payload
 
     result = json.loads(payload)
-    if command in {"GET_PROCESS_LIST", "GET_PROCESSES"}:
+    if command == "GET_PROCESS_LIST":
         return _validate_process_list(result, PROCESS_LIST_TOP_N)
+    if command == "GET_PROCESSES":
+        return _validate_process_list(result, PROCESS_SNAPSHOT_MAX_COUNT)
     if command == "TERMINATE_PROCESS":
         fields = {"status", "code", "pid", "name", "message"}
         if not isinstance(result, dict) or set(result) != fields:
@@ -509,6 +613,19 @@ def _accept_controlled_command_response(
                 command_request.get("pid"),
             )
         except (json.JSONDecodeError, RecursionError, ValueError, OverflowError) as error:
+            if command == "GET_PROCESSES":
+                with state_lock:
+                    current = controlled_command_requests.get(key)
+                    if (
+                        current is not None
+                        and current["request_id"] == request_id
+                        and current["status"] == "delivered"
+                    ):
+                        current["status"] = "error"
+                        current["result"] = None
+                        current["error_code"] = "MALFORMED_RESULT"
+                        current["completed_at"] = time.time()
+                        _mark_process_monitoring_unavailable_locked(key)
             logger.warning(
                 "Rejected malformed %s response from client %s (%s).",
                 command,
@@ -568,12 +685,20 @@ def _accept_controlled_command_response(
         current["error_code"] = error_code
         current["completed_at"] = time.time()
         if command == "GET_PROCESSES" and status == "complete":
-            process_snapshots[key] = {
-                "client": command_request["client"],
-                "processes": result,
-                "updated_at": current["completed_at"],
-                "request_id": request_id,
-            }
+            if not _store_process_snapshot_locked(
+                key,
+                command_request["client"],
+                result,
+                current["completed_at"],
+                request_id,
+            ):
+                current["status"] = "error"
+                current["result"] = None
+                current["error_code"] = "PROCESS_ACTIVITY_STORAGE_UNAVAILABLE"
+                status = "error"
+                error_code = current["error_code"]
+        elif command == "GET_PROCESSES":
+            _mark_process_monitoring_unavailable_locked(key)
         if command == "TERMINATE_PROCESS" and isinstance(audit_id, int):
             current["audit_status"] = "saved" if audit_saved else "error"
     logger.info(
@@ -582,7 +707,12 @@ def _accept_controlled_command_response(
         command_request["client"],
         status,
     )
-    return "OK|COMMAND"
+    return (
+        "ERROR|PROCESS_ACTIVITY_STORAGE"
+        if command == "GET_PROCESSES"
+        and error_code == "PROCESS_ACTIVITY_STORAGE_UNAVAILABLE"
+        else "OK|COMMAND"
+    )
 
 
 def _known_process_name(client_key: str, pid: int) -> str | None:
@@ -723,7 +853,10 @@ def _next_process_command(
 
 
 def _validate_process_list(value: Any, limit: int) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or len(value) > min(limit, PROCESS_LIST_TOP_N):
+    if not isinstance(value, list) or len(value) > min(
+        limit,
+        PROCESS_SNAPSHOT_MAX_COUNT,
+    ):
         raise ValueError("Process list must be an array within the requested limit.")
 
     fields = {
@@ -1597,12 +1730,10 @@ def api_controlled_commands(name: str):
         result.pop("client_ip", None)
         snapshot = process_snapshots.get(key)
         if snapshot is not None:
-            result["process_snapshot_updated_at"] = snapshot["updated_at"]
-            if not (
-                result.get("command") == "GET_PROCESSES"
-                and result.get("status") == "complete"
-            ):
-                result["process_snapshot"] = dict(snapshot)
+            result["process_snapshot_updated_at"] = snapshot.get("updated_at")
+            result["process_snapshot"] = dict(snapshot)
+        elif result.get("command") == "GET_PROCESSES":
+            result["process_monitoring_status"] = "UNAVAILABLE"
     if (
         result.get("command") == "TERMINATE_PROCESS"
         and result.get("status") == "timeout"
@@ -1629,6 +1760,50 @@ def api_controlled_commands(name: str):
                 name,
             )
     return jsonify({"status": "ok", "request": result})
+
+
+@app.get("/api/clients/<name>/process-activity")
+def api_process_activity(name: str):
+    auth_error = _admin_token_error()
+    if auth_error is not None:
+        message, status_code = auth_error
+        return jsonify({"status": "error", "message": message}), status_code
+
+    key = name.lower()
+    with state_lock:
+        if key not in clients:
+            return jsonify({"status": "error", "message": "Client not found"}), 404
+        snapshot = process_snapshots.get(key)
+        snapshot = dict(snapshot) if snapshot is not None else None
+
+    try:
+        events = db_manager.get_process_activity(name, PROCESS_ACTIVITY_API_LIMIT)
+    except RuntimeError as error:
+        logger.error(
+            "API process activity read failed for client %s (%s).",
+            name,
+            type(error).__name__,
+        )
+        return jsonify(
+            {"status": "error", "message": "Could not read process activity history"}
+        ), 503
+
+    return jsonify(
+        {
+            "client": name,
+            "monitoring_status": (
+                snapshot.get("monitoring_status", "UNAVAILABLE")
+                if snapshot is not None
+                else "UNAVAILABLE"
+            ),
+            "last_successful_update": (
+                snapshot.get("last_successful_update")
+                if snapshot is not None
+                else None
+            ),
+            "events": events,
+        }
+    )
 
 
 @app.post("/api/clients/<name>/disconnect")
@@ -1821,6 +1996,9 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
     <p id="process-last-update" class="process-message">
       Cập nhật gần nhất: chưa có
     </p>
+    <p id="process-monitoring-status" class="process-message">
+      Process Monitoring: UNAVAILABLE
+    </p>
     <div style="overflow-x:auto">
       <table>
         <thead>
@@ -1831,10 +2009,27 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
             <th>CPU %</th>
             <th>RAM %</th>
             <th>Trạng thái</th>
+            <th>Hoạt động</th>
           </tr>
         </thead>
         <tbody id="processes">
-          <tr><td colspan="6" class="empty">Chưa tải tiến trình</td></tr>
+          <tr><td colspan="7" class="empty">Chưa tải tiến trình</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>Hoạt động tiến trình gần đây</h3>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Sự kiện</th>
+            <th>PID</th>
+            <th>Tiến trình</th>
+            <th>Thời điểm</th>
+          </tr>
+        </thead>
+        <tbody id="process-activity">
+          <tr><td colspan="4" class="empty">Chưa có hoạt động tiến trình</td></tr>
         </tbody>
       </table>
     </div>
@@ -2056,6 +2251,10 @@ async function refresh() {
       processSnapshots = [];
       processLastUpdatedAt = null;
       selectedProcessPid = null;
+      document.getElementById('process-activity').innerHTML =
+        '<tr><td colspan="4" class="empty">Chưa có hoạt động tiến trình</td></tr>';
+      document.getElementById('process-monitoring-status').textContent =
+        'Process Monitoring: UNAVAILABLE';
       document.getElementById('process-last-update').textContent =
         'Cập nhật gần nhất: chưa có';
       document.getElementById('process-message').textContent =
@@ -2135,6 +2334,10 @@ function selectClient(clientName) {
   processRequestGeneration += 1;
   processSnapshots = [];
   processLastUpdatedAt = null;
+  document.getElementById('process-activity').innerHTML =
+    '<tr><td colspan="4" class="empty">Chưa có hoạt động tiến trình</td></tr>';
+  document.getElementById('process-monitoring-status').textContent =
+    'Process Monitoring: UNAVAILABLE';
   document.getElementById('process-last-update').textContent =
     'Cập nhật gần nhất: chưa có';
   selectedProcessPid = null;
@@ -2239,7 +2442,7 @@ function renderProcessRows() {
     selectedProcessPid = null;
   }
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">Không có tiến trình khớp bộ lọc</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">Không có tiến trình khớp bộ lọc</td></tr>';
     selectedProcessPid = null;
     renderProcessClient();
     return;
@@ -2253,6 +2456,7 @@ function renderProcessRows() {
       <td>${process.cpu_percent == null ? '—' : `${Number(process.cpu_percent).toFixed(2)}%`}</td>
       <td>${process.memory_percent == null ? '—' : `${Number(process.memory_percent).toFixed(2)}%`}</td>
       <td>${escapeHtml(process.status || '—')}</td>
+      <td><strong>${escapeHtml(process.activity_status || 'RUNNING')}</strong></td>
     </tr>
   `).join('');
   tbody.querySelectorAll('tr[data-process-pid]').forEach(row => {
@@ -2275,8 +2479,54 @@ function applyProcessSnapshot(snapshot) {
     document.getElementById('process-last-update').textContent =
       `Cập nhật gần nhất: ${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}`;
   }
+  document.getElementById('process-monitoring-status').textContent =
+    `Process Monitoring: ${snapshot.monitoring_status || 'AVAILABLE'}`;
   renderProcessRows();
   return true;
+}
+
+async function refreshProcessActivity(clientName, generation) {
+  const status = document.getElementById('process-monitoring-status');
+  const tbody = document.getElementById('process-activity');
+  try {
+    const data = await adminFetch(
+      `/api/clients/${encodeURIComponent(clientName)}/process-activity`
+    );
+    if (
+      generation !== processRequestGeneration ||
+      selectedClientName !== clientName
+    ) return;
+    status.textContent = `Process Monitoring: ${data.monitoring_status}`;
+    if (data.last_successful_update != null) {
+      processLastUpdatedAt = Number(data.last_successful_update);
+      document.getElementById('process-last-update').textContent =
+        `Cập nhật gần nhất: ${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}`;
+    } else {
+      document.getElementById('process-last-update').textContent =
+        'Cập nhật gần nhất: chưa có';
+    }
+    if (!Array.isArray(data.events) || data.events.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">Chưa có hoạt động tiến trình</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.events.map(event => `
+      <tr>
+        <td><strong>${event.event_type === 'STARTED' ? 'NEW' : 'STOPPED'}</strong></td>
+        <td>${Number(event.pid)}</td>
+        <td>${escapeHtml(event.process_name)}</td>
+        <td>${escapeHtml(event.timestamp || '—')}</td>
+      </tr>
+    `).join('');
+  } catch (error) {
+    if (
+      generation === processRequestGeneration &&
+      selectedClientName === clientName
+    ) {
+      document.getElementById('process-message').textContent =
+        'Không thể tải lịch sử hoạt động tiến trình.';
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">Không thể tải hoạt động tiến trình</td></tr>';
+    }
+  }
 }
 
 async function refreshProcesses() {
@@ -2323,16 +2573,11 @@ async function refreshProcesses() {
       applyProcessSnapshot(request.process_snapshot);
       throw new Error(request.error_code || 'Máy khách không thể trả danh sách tiến trình.');
     }
-    processSnapshots = request.result;
-    if (
-      request.process_snapshot_updated_at != null &&
-      Number.isFinite(Number(request.process_snapshot_updated_at))
-    ) {
-      processLastUpdatedAt = Number(request.process_snapshot_updated_at);
-      document.getElementById('process-last-update').textContent =
-        `Cập nhật gần nhất: ${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}`;
+    if (!applyProcessSnapshot(request.process_snapshot)) {
+      processSnapshots = request.result;
+      renderProcessRows();
     }
-    renderProcessRows();
+    await refreshProcessActivity(client.name, generation);
     message.textContent = `Đã nhận ${processSnapshots.length} tiến trình từ ${client.name}.`;
   } catch (error) {
     if (
@@ -2340,6 +2585,7 @@ async function refreshProcesses() {
       selectedClientName === client.name
     ) {
       applyProcessSnapshot(error.payload && error.payload.process_snapshot);
+      await refreshProcessActivity(client.name, generation);
       message.textContent = processLastUpdatedAt == null
         ? `Không thể tải tiến trình: ${error.message}`
         : `Không thể cập nhật tiến trình; đang hiển thị dữ liệu gần nhất (${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}): ${error.message}`;

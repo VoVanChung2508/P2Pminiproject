@@ -5,7 +5,7 @@ import json
 import os
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from client import process_monitor, tcp_client
 from common.command_auth import sign_process_command, verify_process_command
@@ -179,7 +179,7 @@ class ProcessCommandAuthenticationTests(TestCase):
         with patch.dict(os.environ, {"MONITOR_ADMIN_TOKEN": "client-secret"}):
             with patch.object(
                 tcp_client,
-                "collect_process_list",
+                "collect_process_snapshot",
                 return_value=[
                     {
                         "pid": 42,
@@ -237,6 +237,8 @@ class RemoteProcessCommandTests(TestCase):
             ("update_status", True),
             ("add_process_termination_audit", 7001),
             ("complete_process_termination_audit", True),
+            ("record_process_activity", True),
+            ("get_process_activity", []),
         ):
             active_patch = patch.object(
                 server.db_manager,
@@ -324,14 +326,65 @@ class RemoteProcessCommandTests(TestCase):
         )
         self.assertEqual(
             server.process_snapshots["process-one"]["processes"],
-            [self.PROCESS],
+            [{**self.PROCESS, "activity_status": "RUNNING"}],
         )
 
         next_queued = self.queue("process-one", "GET_PROCESSES")
         self.assertEqual(
             next_queued.get_json()["process_snapshot"]["processes"],
-            [self.PROCESS],
+            [{**self.PROCESS, "activity_status": "RUNNING"}],
         )
+
+    def test_full_process_snapshot_exceeds_legacy_display_limit(self) -> None:
+        self.register("full-snapshot", self.ADDRESS_ONE)
+        processes = [
+            {**self.PROCESS, "pid": pid, "name": f"process-{pid}.exe"}
+            for pid in range(1, server.PROCESS_LIST_TOP_N + 11)
+        ]
+        queued = self.queue("full-snapshot", "GET_PROCESSES").get_json()["request"]
+        server.handle_message("HEARTBEAT|full-snapshot", self.ADDRESS_ONE)
+
+        response = server.handle_message(
+            f"RESPONSE|{queued['request_id']}|{json.dumps(processes)}",
+            self.ADDRESS_ONE,
+        )
+
+        self.assertEqual(response, "OK|COMMAND")
+        self.assertEqual(
+            len(server.process_snapshots["full-snapshot"]["processes"]),
+            server.PROCESS_LIST_TOP_N + 10,
+        )
+
+    def test_legacy_process_list_does_not_replace_activity_snapshot(self) -> None:
+        self.register("process-one", self.ADDRESS_ONE)
+        queued_snapshot = self.queue("process-one", "GET_PROCESSES").get_json()["request"]
+        server.handle_message("HEARTBEAT|process-one", self.ADDRESS_ONE)
+        self.assertEqual(
+            server.handle_message(
+                f"RESPONSE|{queued_snapshot['request_id']}|{json.dumps([self.PROCESS])}",
+                self.ADDRESS_ONE,
+            ),
+            "OK|COMMAND",
+        )
+        saved_snapshot = copy.deepcopy(server.process_snapshots["process-one"])
+
+        legacy_request = self.client.post(
+            "/api/clients/process-one/process-list",
+            headers=self.admin_headers(),
+        )
+        request_id = legacy_request.get_json()["request"]["request_id"]
+        command = server.handle_message("HEARTBEAT|process-one", self.ADDRESS_ONE)
+        self.assertTrue(command.startswith(f"COMMAND|GET_PROCESS_LIST|{request_id}|"))
+        self.assertEqual(
+            server.handle_message(
+                f"PROCESS_LIST|process-one|{request_id}|[]",
+                self.ADDRESS_ONE,
+            ),
+            "OK|PROCESS_LIST",
+        )
+
+        self.assertEqual(server.process_snapshots["process-one"], saved_snapshot)
+        server.db_manager.record_process_activity.assert_not_called()
 
     def test_process_snapshots_are_isolated_and_survive_failed_refreshes(self) -> None:
         self.register("pc-01", self.ADDRESS_ONE)
@@ -360,7 +413,10 @@ class RemoteProcessCommandTests(TestCase):
                 headers=self.admin_headers(),
             ).get_json()
             self.assertEqual(payload["request"]["result"], [process])
-            self.assertEqual(server.process_snapshots[name]["processes"], [process])
+            self.assertEqual(
+                server.process_snapshots[name]["processes"],
+                [{**process, "activity_status": "RUNNING"}],
+            )
 
         self.assertNotEqual(
             server.process_snapshots["pc-01"]["processes"],
@@ -386,9 +442,190 @@ class RemoteProcessCommandTests(TestCase):
             previous_snapshot["processes"],
         )
         self.assertEqual(
-            server.process_snapshots["pc-01"],
-            previous_snapshot,
+            server.process_snapshots["pc-01"]["last_successful_update"],
+            previous_snapshot["last_successful_update"],
         )
+        self.assertEqual(
+            server.process_snapshots["pc-01"]["monitoring_status"],
+            "UNAVAILABLE",
+        )
+
+    def test_oversized_snapshot_marks_unavailable_without_closing_processes(self) -> None:
+        self.register("pc-01", self.ADDRESS_ONE)
+        baseline = self.queue("pc-01", "GET_PROCESSES").get_json()["request"]
+        server.handle_message("HEARTBEAT|pc-01", self.ADDRESS_ONE)
+        server.handle_message(
+            f"RESPONSE|{baseline['request_id']}|{json.dumps([self.PROCESS])}",
+            self.ADDRESS_ONE,
+        )
+        last_good_processes = copy.deepcopy(
+            server.process_snapshots["pc-01"]["processes"]
+        )
+
+        refresh = self.queue("pc-01", "GET_PROCESSES").get_json()["request"]
+        server.handle_message("HEARTBEAT|pc-01", self.ADDRESS_ONE)
+        oversized = [
+            {**self.PROCESS, "pid": pid, "name": f"process-{pid}"}
+            for pid in range(1, server.PROCESS_SNAPSHOT_MAX_COUNT + 2)
+        ]
+        response = server.handle_message(
+            f"RESPONSE|{refresh['request_id']}|{json.dumps(oversized)}",
+            self.ADDRESS_ONE,
+        )
+
+        self.assertEqual(response, "ERROR|MALFORMED_COMMAND_RESPONSE")
+        request = self.client.get(
+            "/api/clients/pc-01/commands",
+            headers=self.admin_headers(),
+        ).get_json()["request"]
+        self.assertEqual(request["status"], "error")
+        self.assertEqual(request["error_code"], "MALFORMED_RESULT")
+        self.assertEqual(
+            server.process_snapshots["pc-01"]["processes"],
+            last_good_processes,
+        )
+        self.assertEqual(
+            server.process_snapshots["pc-01"]["monitoring_status"],
+            "UNAVAILABLE",
+        )
+        server.db_manager.record_process_activity.assert_not_called()
+
+    def test_snapshot_diffs_record_only_changes_for_the_matching_client(self) -> None:
+        self.register("pc-01", self.ADDRESS_ONE)
+        self.register("pc-02", self.ADDRESS_TWO)
+
+        def send_snapshot(name: str, address: tuple[str, int], processes: list[dict]):
+            queued = self.queue(name, "GET_PROCESSES").get_json()["request"]
+            server.handle_message(f"HEARTBEAT|{name}", address)
+            response = server.handle_message(
+                f"RESPONSE|{queued['request_id']}|{json.dumps(processes)}",
+                address,
+            )
+            self.assertEqual(response, "OK|COMMAND")
+
+        activity_writer = server.db_manager.record_process_activity
+        first = self.PROCESS
+        started = {**self.PROCESS, "pid": 5000, "name": "notepad.exe"}
+        other_client = {**self.PROCESS, "pid": 6000, "name": "calculator.exe"}
+
+        send_snapshot("pc-01", self.ADDRESS_ONE, [first])
+        send_snapshot("pc-02", self.ADDRESS_TWO, [self.PROCESS])
+        send_snapshot("pc-01", self.ADDRESS_ONE, [first, started])
+        send_snapshot("pc-01", self.ADDRESS_ONE, [first, started])
+        send_snapshot("pc-01", self.ADDRESS_ONE, [first])
+        send_snapshot("pc-02", self.ADDRESS_TWO, [self.PROCESS, other_client])
+
+        self.assertEqual(
+            activity_writer.call_args_list,
+            [
+                call("pc-01", [
+                    {"pid": 5000, "name": "notepad.exe", "event_type": "STARTED"}
+                ]),
+                call("pc-01", [
+                    {"pid": 5000, "name": "notepad.exe", "event_type": "STOPPED"}
+                ]),
+                call("pc-02", [
+                    {"pid": 6000, "name": "calculator.exe", "event_type": "STARTED"}
+                ]),
+            ],
+        )
+        self.assertEqual(
+            server.process_snapshots["pc-01"]["processes"],
+            [{**first, "activity_status": "RUNNING"}],
+        )
+        self.assertEqual(
+            server.process_snapshots["pc-02"]["processes"][-1]["activity_status"],
+            "NEW",
+        )
+
+    def test_initial_snapshot_is_a_baseline_and_collection_failure_preserves_it(self) -> None:
+        self.register("pc-01", self.ADDRESS_ONE)
+        queued = self.queue("pc-01", "GET_PROCESSES").get_json()["request"]
+        server.handle_message("HEARTBEAT|pc-01", self.ADDRESS_ONE)
+        self.assertEqual(
+            server.handle_message(
+                f"RESPONSE|{queued['request_id']}|{json.dumps([self.PROCESS])}",
+                self.ADDRESS_ONE,
+            ),
+            "OK|COMMAND",
+        )
+        self.assertEqual(
+            server.db_manager.record_process_activity.call_count,
+            0,
+        )
+        previous = copy.deepcopy(server.process_snapshots["pc-01"])
+
+        failed = self.queue("pc-01", "GET_PROCESSES").get_json()["request"]
+        server.handle_message("HEARTBEAT|pc-01", self.ADDRESS_ONE)
+        self.assertEqual(
+            server.handle_message(
+                f"COMMAND_ERROR|{failed['request_id']}|UNAVAILABLE",
+                self.ADDRESS_ONE,
+            ),
+            "OK|COMMAND",
+        )
+        self.assertEqual(
+            server.process_snapshots["pc-01"]["processes"],
+            previous["processes"],
+        )
+        self.assertEqual(
+            server.process_snapshots["pc-01"]["last_successful_update"],
+            previous["last_successful_update"],
+        )
+        self.assertEqual(
+            server.process_snapshots["pc-01"]["monitoring_status"],
+            "UNAVAILABLE",
+        )
+
+    def test_activity_storage_failure_does_not_replace_the_last_good_snapshot(self) -> None:
+        self.register("pc-01", self.ADDRESS_ONE)
+
+        def send_snapshot(processes: list[dict]) -> str:
+            queued = self.queue("pc-01", "GET_PROCESSES").get_json()["request"]
+            server.handle_message("HEARTBEAT|pc-01", self.ADDRESS_ONE)
+            return server.handle_message(
+                f"RESPONSE|{queued['request_id']}|{json.dumps(processes)}",
+                self.ADDRESS_ONE,
+            )
+
+        self.assertEqual(send_snapshot([self.PROCESS]), "OK|COMMAND")
+        previous = copy.deepcopy(server.process_snapshots["pc-01"])
+        server.db_manager.record_process_activity.return_value = False
+        added = {**self.PROCESS, "pid": 5000, "name": "notepad.exe"}
+
+        self.assertEqual(send_snapshot([self.PROCESS, added]), "ERROR|PROCESS_ACTIVITY_STORAGE")
+        self.assertEqual(
+            server.process_snapshots["pc-01"]["processes"],
+            previous["processes"],
+        )
+        self.assertEqual(
+            server.process_snapshots["pc-01"]["monitoring_status"],
+            "UNAVAILABLE",
+        )
+
+    def test_activity_api_requires_admin_token_and_returns_client_scoped_events(self) -> None:
+        self.register("pc-01", self.ADDRESS_ONE)
+        server.db_manager.get_process_activity.return_value = [
+            {
+                "pid": 1234,
+                "process_name": "notepad.exe",
+                "event_type": "STARTED",
+                "timestamp": "2026-09-29T08:52:31",
+            }
+        ]
+
+        unauthorized = self.client.get("/api/clients/pc-01/process-activity")
+        self.assertEqual(unauthorized.status_code, 401)
+        response = self.client.get(
+            "/api/clients/pc-01/process-activity",
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["client"], "pc-01")
+        self.assertEqual(response.get_json()["monitoring_status"], "UNAVAILABLE")
+        self.assertEqual(response.get_json()["events"][0]["pid"], 1234)
+        server.db_manager.get_process_activity.assert_called_once_with("pc-01", 50)
 
     def test_dashboard_contains_process_management_controls(self) -> None:
         response = self.client.get("/")
@@ -402,6 +639,10 @@ class RemoteProcessCommandTests(TestCase):
             "refresh-processes",
             "terminate-process",
             "process-last-update",
+            "process-monitoring-status",
+            "process-activity",
+            "Process Monitoring:",
+            "STARTED",
             "10000",
         ):
             with self.subTest(control=control):
@@ -474,6 +715,50 @@ class RemoteProcessCommandTests(TestCase):
         ).get_json()["request"]
         self.assertEqual(result["result"]["name"], "worker.exe")
         self.assertEqual(result["audit_status"], "saved")
+
+    def test_remote_termination_is_detected_as_a_stopped_process(self) -> None:
+        self.register("termination-node")
+        first_request = self.queue("termination-node", "GET_PROCESSES").get_json()["request"]
+        server.handle_message("HEARTBEAT|termination-node", self.ADDRESS_ONE)
+        self.assertEqual(
+            server.handle_message(
+                f"RESPONSE|{first_request['request_id']}|{json.dumps([self.PROCESS])}",
+                self.ADDRESS_ONE,
+            ),
+            "OK|COMMAND",
+        )
+
+        terminate = self.queue("termination-node", "TERMINATE_PROCESS", 4521)
+        terminate_request = terminate.get_json()["request"]
+        server.handle_message("HEARTBEAT|termination-node", self.ADDRESS_ONE)
+        terminated = {
+            "status": "ok",
+            "code": "PROCESS_TERMINATED",
+            "pid": 4521,
+            "name": "worker.exe",
+            "message": "Process terminated successfully.",
+        }
+        self.assertEqual(
+            server.handle_message(
+                f"RESPONSE|{terminate_request['request_id']}|{json.dumps(terminated)}",
+                self.ADDRESS_ONE,
+            ),
+            "OK|COMMAND",
+        )
+
+        next_snapshot = self.queue("termination-node", "GET_PROCESSES").get_json()["request"]
+        server.handle_message("HEARTBEAT|termination-node", self.ADDRESS_ONE)
+        self.assertEqual(
+            server.handle_message(
+                f"RESPONSE|{next_snapshot['request_id']}|[]",
+                self.ADDRESS_ONE,
+            ),
+            "OK|COMMAND",
+        )
+        server.db_manager.record_process_activity.assert_called_once_with(
+            "termination-node",
+            [{"pid": 4521, "name": "worker.exe", "event_type": "STOPPED"}],
+        )
 
     def test_termination_timeout_is_recorded_in_audit(self) -> None:
         self.register("timeout-node")

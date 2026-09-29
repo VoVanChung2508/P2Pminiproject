@@ -18,7 +18,12 @@ if __package__ in (None, ""):
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-from client.process_monitor import TOP_N, collect_process_list, terminate_process
+from client.process_monitor import (
+    TOP_N,
+    collect_process_list,
+    collect_process_snapshot,
+    terminate_process,
+)
 from common.command_auth import verify_process_command
 
 
@@ -281,7 +286,7 @@ class TCPClient:
                 process_list = collect_process_list(int(parts[3]))
                 response_payload = json.dumps(process_list, separators=(",", ":"))
             elif command_name == "GET_PROCESSES":
-                process_list = collect_process_list(TOP_N)
+                process_list = collect_process_snapshot()
                 response_payload = json.dumps(process_list, separators=(",", ":"))
             elif command_name == "TERMINATE_PROCESS":
                 termination_result = terminate_process(int(signed_argument))
