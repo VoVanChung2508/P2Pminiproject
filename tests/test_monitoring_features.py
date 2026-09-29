@@ -1013,7 +1013,7 @@ class ProcessMonitoringTests(unittest.TestCase):
 
         self.assertEqual(
             message,
-            "REGISTER|process-node|127.0.0.1|8888|PROCESS_LIST_V1|CONTROLLED_COMMANDS_V1",
+            "REGISTER|process-node|127.0.0.1|8888|PROCESS_LIST_V1|CONTROLLED_COMMANDS_V1|PROCESS_MANAGEMENT_V1",
         )
         self.assertEqual(
             server.handle_message(message, ("127.0.0.1", 30000)),
@@ -1626,7 +1626,7 @@ class ProcessCollectorTests(unittest.TestCase):
                             "status": "running",
                         }
                     )
-                    for index in range(25)
+                    for index in range(process_monitor.TOP_N + 15)
                 ]
                 denied = FakePsutil.Process(error=FakeAccessDenied())
                 missing = FakePsutil.Process(error=FakeNoSuchProcess())
@@ -2273,6 +2273,27 @@ class StartupDatabaseTests(unittest.TestCase):
         self.assertEqual(thread.call_count, 2)
         run.assert_called_once()
 
+    def test_server_starts_without_admin_token_and_disables_admin_operations(self) -> None:
+        with patch.object(server, "ADMIN_TOKEN", ""), patch.object(
+            server, "configure_logging"
+        ), patch.object(
+            server, "ensure_ports_available"
+        ), patch.object(
+            server.db_manager, "connect", return_value=True
+        ), patch.object(
+            server.db_manager, "mark_all_clients_offline", return_value=True
+        ), patch.object(server.logger, "warning") as warning:
+            with patch.object(server.threading, "Thread") as thread:
+                with patch.object(server.app, "run") as run:
+                    server.start_services()
+
+        warning.assert_called_once_with(
+            "MONITOR_ADMIN_TOKEN is not configured. "
+            "Administrative operations are disabled."
+        )
+        self.assertEqual(thread.call_count, 2)
+        run.assert_called_once()
+
     def test_server_refuses_to_start_without_mysql(self) -> None:
         with patch.object(server, "configure_logging"), patch.object(
             server, "ensure_ports_available"
@@ -2313,6 +2334,23 @@ class StartupDatabaseTests(unittest.TestCase):
         child_environment = popen.call_args.kwargs["env"]
         for name, value in inherited.items():
             self.assertEqual(child_environment[name], value)
+
+    def test_server_manager_shows_admin_configuration_without_exposing_token(
+        self,
+    ) -> None:
+        manager = server_gui.ServerManagerGUI.__new__(server_gui.ServerManagerGUI)
+        manager.admin_status_var = Mock()
+        manager.admin_status_label = Mock()
+        manager.process_control_var = Mock()
+        manager.process_control_label = Mock()
+
+        manager._update_admin_status(False)
+        manager.admin_status_var.set.assert_called_with("NOT CONFIGURED")
+        manager.process_control_var.set.assert_called_with("DISABLED")
+
+        manager._update_admin_status(True)
+        manager.admin_status_var.set.assert_called_with("CONFIGURED")
+        manager.process_control_var.set.assert_called_with("ENABLED")
 
 
 class PersistentDashboardAPITests(unittest.TestCase):

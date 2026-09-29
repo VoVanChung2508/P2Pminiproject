@@ -441,6 +441,45 @@ class DatabaseManager:
                 """
             )
 
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS process_termination_audit (
+
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+                    client_key VARCHAR(100)
+                        NOT NULL,
+
+                    client_name VARCHAR(100)
+                        NOT NULL,
+
+                    client_ip VARCHAR(45) NULL,
+
+                    pid BIGINT UNSIGNED NULL,
+
+                    process_name VARCHAR(256) NULL,
+
+                    action VARCHAR(32)
+                        NOT NULL,
+
+                    result VARCHAR(32)
+                        NOT NULL,
+
+                    error_reason VARCHAR(512) NULL,
+
+                    requested_at DATETIME NOT NULL,
+
+                    completed_at DATETIME NULL,
+
+                    INDEX idx_process_audit_client_time
+                    (client_key, requested_at)
+
+                )
+                ENGINE=InnoDB
+                DEFAULT CHARSET=utf8mb4;
+                """
+            )
+
             additive_columns = {
                 "clients": {
                     "upload_bytes_per_sec": "DOUBLE NULL",
@@ -943,6 +982,97 @@ class DatabaseManager:
             self._handle_operation_error("add_alert", e)
             return False
 
+        finally:
+            self._close_cursor(cursor)
+
+    @_synchronized
+    def add_process_termination_audit(
+        self,
+        client_name: str,
+        client_ip: str | None,
+        pid: int | None,
+        process_name: str | None = None,
+    ) -> int | None:
+        if not self._check_connection():
+            return None
+
+        cursor = None
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO process_termination_audit
+                (
+                    client_key,
+                    client_name,
+                    client_ip,
+                    pid,
+                    process_name,
+                    action,
+                    result,
+                    error_reason,
+                    requested_at
+                )
+                VALUES (%s, %s, %s, %s, %s, 'TERMINATE_PROCESS', 'REQUESTED', NULL, %s)
+                """,
+                (
+                    client_name.lower(),
+                    client_name,
+                    client_ip,
+                    pid,
+                    process_name,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            audit_id = cursor.lastrowid
+            self.db_conn.commit()
+            return int(audit_id) if audit_id is not None else None
+        except Exception as error:
+            self._handle_operation_error("add_process_termination_audit", error)
+            return None
+        finally:
+            self._close_cursor(cursor)
+
+    @_synchronized
+    def complete_process_termination_audit(
+        self,
+        audit_id: int,
+        process_name: str | None,
+        result: str,
+        error_reason: str | None = None,
+    ) -> bool:
+        if not self._check_connection():
+            return False
+        if result not in {"SUCCESS", "FAILED", "TIMEOUT", "REJECTED"}:
+            raise ValueError("Unsupported process termination audit result.")
+
+        cursor = None
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                """
+                UPDATE process_termination_audit
+                SET process_name = %s,
+                    result = %s,
+                    error_reason = %s,
+                    completed_at = %s
+                WHERE id = %s
+                """,
+                (
+                    process_name,
+                    result,
+                    error_reason[:512] if error_reason else None,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    audit_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Process termination audit record was not found.")
+            self.db_conn.commit()
+            return True
+        except Exception as error:
+            self._handle_operation_error("complete_process_termination_audit", error)
+            return False
         finally:
             self._close_cursor(cursor)
 

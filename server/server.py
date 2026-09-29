@@ -12,6 +12,7 @@ from os import environ
 from typing import Any
 
 from flask import Flask, jsonify, render_template_string, request
+from common.command_auth import sign_process_command
 from common.database import DatabaseManager
 from common.logging_config import configure_logging
 
@@ -25,10 +26,20 @@ SAMPLE_LIMIT = 120
 ADMIN_TOKEN = environ.get("MONITOR_ADMIN_TOKEN", "")
 PROCESS_LIST_CAPABILITY = "PROCESS_LIST_V1"
 CONTROLLED_COMMANDS_CAPABILITY = "CONTROLLED_COMMANDS_V1"
+PROCESS_MANAGEMENT_CAPABILITY = "PROCESS_MANAGEMENT_V1"
 CONTROLLED_COMMANDS = frozenset(
-    {"PING", "GET_INFO", "GET_PROCESS_LIST", "GET_NETWORK_INFO"}
+    {
+        "PING",
+        "GET_INFO",
+        "GET_PROCESS_LIST",
+        "GET_NETWORK_INFO",
+        "GET_PROCESSES",
+        "TERMINATE_PROCESS",
+    }
 )
-PROCESS_LIST_TOP_N = 20
+PROCESS_MANAGEMENT_COMMANDS = frozenset({"GET_PROCESSES", "TERMINATE_PROCESS"})
+MAX_REMOTE_PROCESS_PID = 4_294_967_295
+PROCESS_LIST_TOP_N = 50
 PROCESS_LIST_REQUEST_TIMEOUT_SECONDS = 30
 PROCESS_LIST_MAX_PAYLOAD_BYTES = 65536
 PROCESS_LIST_MAX_TCP_FRAME_BYTES = PROCESS_LIST_MAX_PAYLOAD_BYTES + 512
@@ -43,6 +54,7 @@ clients: dict[str, dict[str, Any]] = {}
 disconnected_clients: set[str] = set()
 process_requests: dict[str, dict[str, Any]] = {}
 controlled_command_requests: dict[str, dict[str, Any]] = {}
+process_snapshots: dict[str, dict[str, Any]] = {}
 
 db_manager = DatabaseManager()
 
@@ -88,6 +100,7 @@ def register_client(
     ip: str,
     process_list_capable: bool = False,
     controlled_commands_capable: bool = False,
+    process_management_capable: bool = False,
 ) -> None:
     key = name.lower()
     if not db_manager.register_client(name, ip):
@@ -95,6 +108,7 @@ def register_client(
     with state_lock:
         disconnected_clients.discard(key)
         controlled_command_requests.pop(key, None)
+        process_snapshots.pop(key, None)
         clients[key] = {
             "name": name,
             "ip": ip,
@@ -102,6 +116,7 @@ def register_client(
             "last_seen_epoch": time.time(),
             "process_list_capable": process_list_capable,
             "controlled_commands_capable": controlled_commands_capable,
+            "process_management_capable": process_management_capable,
         }
     logger.info("Client %s registered from %s.", name, ip)
 
@@ -213,9 +228,18 @@ def _prune_controlled_commands_locked(now: float) -> None:
 def _queue_controlled_command(
     name: str,
     command: str,
+    *,
+    pid: int | None = None,
+    audit_id: int | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     if command not in CONTROLLED_COMMANDS:
         return None, "Unsupported command."
+    if command == "TERMINATE_PROCESS" and (
+        type(pid) is not int or not 1 <= pid <= MAX_REMOTE_PROCESS_PID
+    ):
+        return None, "A valid positive process ID is required."
+    if command != "TERMINATE_PROCESS" and pid is not None:
+        return None, "A process ID is only valid for TERMINATE_PROCESS."
 
     key = name.lower()
     with state_lock:
@@ -230,6 +254,13 @@ def _queue_controlled_command(
             return None, "Client is not registered or is offline."
         if not client.get("controlled_commands_capable", False):
             return None, "Client does not support controlled commands."
+        if (
+            command in PROCESS_MANAGEMENT_COMMANDS
+            and not client.get("process_management_capable", False)
+        ):
+            return None, "Client does not support remote process management."
+        if command in PROCESS_MANAGEMENT_COMMANDS and not ADMIN_TOKEN:
+            return None, "Server admin token is not configured."
         _expire_controlled_command_locked(key)
         existing = controlled_command_requests.get(key)
         if existing and existing["status"] in {"pending", "delivered"}:
@@ -248,8 +279,11 @@ def _queue_controlled_command(
 
         command_request = {
             "client": client["name"],
+            "client_ip": client["ip"],
             "request_id": uuid.uuid4().hex,
             "command": command,
+            "pid": pid,
+            "audit_id": audit_id,
             "status": "pending",
             "requested_at": time.time(),
             "expires_at": now + CONTROLLED_COMMAND_REQUEST_TIMEOUT_SECONDS,
@@ -280,6 +314,28 @@ def _next_controlled_command(
         command_request["status"] = "delivered"
         command_request["delivery_address"] = address
         command = command_request["command"]
+        if command in PROCESS_MANAGEMENT_COMMANDS:
+            argument = (
+                str(command_request["pid"])
+                if command == "TERMINATE_PROCESS"
+                else ""
+            )
+            signature = sign_process_command(
+                ADMIN_TOKEN,
+                command_request["request_id"],
+                client["name"],
+                command,
+                argument,
+            )
+            if command == "TERMINATE_PROCESS":
+                return (
+                    f"COMMAND|{command_request['request_id']}|{command}|"
+                    f"{argument}|{signature}"
+                )
+            return (
+                f"COMMAND|{command_request['request_id']}|{command}|"
+                f"{signature}"
+            )
         if command == "GET_PROCESS_LIST":
             return (
                 f"COMMAND|{command_request['request_id']}|{command}|"
@@ -291,6 +347,7 @@ def _next_controlled_command(
 def _validate_controlled_command_result(
     command: str,
     payload: str,
+    expected_pid: int | None = None,
 ) -> Any:
     if len(payload.encode("utf-8")) > PROCESS_LIST_MAX_PAYLOAD_BYTES:
         raise ValueError("Command response exceeds the maximum size.")
@@ -300,8 +357,56 @@ def _validate_controlled_command_result(
         return payload
 
     result = json.loads(payload)
-    if command == "GET_PROCESS_LIST":
+    if command in {"GET_PROCESS_LIST", "GET_PROCESSES"}:
         return _validate_process_list(result, PROCESS_LIST_TOP_N)
+    if command == "TERMINATE_PROCESS":
+        fields = {"status", "code", "pid", "name", "message"}
+        if not isinstance(result, dict) or set(result) != fields:
+            raise ValueError("Process termination result fields are invalid.")
+        if (
+            result["status"] not in {"ok", "error"}
+            or result["code"]
+            not in {
+                "PROCESS_TERMINATED",
+                "INVALID_PID",
+                "PROCESS_NOT_FOUND",
+                "ACCESS_DENIED",
+                "PROTECTED_PROCESS",
+                "TERMINATION_TIMEOUT",
+                "UNAVAILABLE",
+                "FAILED",
+            }
+            or isinstance(result["pid"], bool)
+            or not isinstance(result["pid"], int)
+            or result["pid"] <= 0
+            or result["pid"] > MAX_REMOTE_PROCESS_PID
+            or result["pid"] != expected_pid
+            or (
+                result["name"] is not None
+                and (
+                    not isinstance(result["name"], str)
+                    or not result["name"]
+                    or len(result["name"]) > 256
+                )
+            )
+            or not isinstance(result["message"], str)
+            or len(result["message"]) > 512
+        ):
+            raise ValueError("Process termination result is invalid.")
+        if (
+            result["status"] == "ok"
+            and (
+                result["code"] != "PROCESS_TERMINATED"
+                or not result["name"]
+            )
+        ):
+            raise ValueError("Process termination result does not match its request.")
+        if (
+            result["status"] == "error"
+            and result["code"] == "PROCESS_TERMINATED"
+        ):
+            raise ValueError("Failed process termination has a success result.")
+        return dict(result)
     if command == "GET_INFO":
         fields = {
             "client_name",
@@ -386,13 +491,23 @@ def _accept_controlled_command_response(
         command = command_request["command"]
 
     if error_code is not None:
-        if error_code not in {"UNAVAILABLE", "FAILED", "UNSUPPORTED"}:
+        if error_code not in {
+            "UNAVAILABLE",
+            "FAILED",
+            "UNSUPPORTED",
+            "UNAUTHORIZED",
+            "REPLAYED",
+        }:
             return "ERROR|MALFORMED_COMMAND_RESPONSE"
         result = None
         status = "error"
     else:
         try:
-            result = _validate_controlled_command_result(command, payload)
+            result = _validate_controlled_command_result(
+                command,
+                payload,
+                command_request.get("pid"),
+            )
         except (json.JSONDecodeError, RecursionError, ValueError, OverflowError) as error:
             logger.warning(
                 "Rejected malformed %s response from client %s (%s).",
@@ -402,6 +517,42 @@ def _accept_controlled_command_response(
             )
             return "ERROR|MALFORMED_COMMAND_RESPONSE"
         status = "complete"
+
+    audit_id = command_request.get("audit_id")
+    audit_result = None
+    audit_process_name = None
+    audit_error = None
+    if command == "TERMINATE_PROCESS" and isinstance(audit_id, int):
+        if error_code is not None:
+            audit_result = "FAILED"
+            audit_error = error_code
+        elif isinstance(result, dict):
+            audit_process_name = result.get("name")
+            if result.get("status") == "ok":
+                audit_result = "SUCCESS"
+            else:
+                audit_result = "FAILED"
+                audit_error = result.get("code", "FAILED")
+        else:
+            audit_result = "FAILED"
+            audit_error = "MALFORMED_RESULT"
+        audit_saved = db_manager.complete_process_termination_audit(
+            audit_id,
+            audit_process_name,
+            audit_result,
+            audit_error,
+        )
+        logger.info(
+            "Remote process termination client=%s client_ip=%s action=TERMINATE_PROCESS "
+            "pid=%s process=%s result=%s reason=%s audit_saved=%s",
+            command_request["client"],
+            command_request.get("client_ip"),
+            command_request.get("pid"),
+            audit_process_name or "unknown",
+            audit_result,
+            audit_error or "-",
+            audit_saved,
+        )
 
     with state_lock:
         current = controlled_command_requests.get(key)
@@ -414,7 +565,17 @@ def _accept_controlled_command_response(
             return "ERROR|INVALID_COMMAND_REQUEST"
         current["status"] = status
         current["result"] = result
+        current["error_code"] = error_code
         current["completed_at"] = time.time()
+        if command == "GET_PROCESSES" and status == "complete":
+            process_snapshots[key] = {
+                "client": command_request["client"],
+                "processes": result,
+                "updated_at": current["completed_at"],
+                "request_id": request_id,
+            }
+        if command == "TERMINATE_PROCESS" and isinstance(audit_id, int):
+            current["audit_status"] = "saved" if audit_saved else "error"
     logger.info(
         "Controlled command %s for client %s completed with status %s.",
         command,
@@ -422,6 +583,78 @@ def _accept_controlled_command_response(
         status,
     )
     return "OK|COMMAND"
+
+
+def _known_process_name(client_key: str, pid: int) -> str | None:
+    with state_lock:
+        request_data = controlled_command_requests.get(client_key)
+        if (
+            request_data is None
+            or request_data.get("command") != "GET_PROCESSES"
+            or request_data.get("status") != "complete"
+            or not isinstance(request_data.get("result"), list)
+        ):
+            return None
+        for process in request_data["result"]:
+            if isinstance(process, dict) and process.get("pid") == pid:
+                return process.get("name")
+    return None
+
+
+def _start_termination_audit(
+    name: str,
+    pid: int | None,
+    process_name: str | None,
+) -> tuple[int | None, str, str | None]:
+    key = name.lower()
+    with state_lock:
+        client = clients.get(key)
+        client_name = str(client["name"]) if client else name[:100]
+        client_ip = str(client["ip"]) if client else None
+    logger.info(
+        "Remote process termination client=%s client_ip=%s action=TERMINATE_PROCESS "
+        "pid=%s process=%s result=REQUESTED",
+        client_name,
+        client_ip or "unknown",
+        pid if pid is not None else "invalid",
+        process_name or "unknown",
+    )
+    audit_id = db_manager.add_process_termination_audit(
+        client_name,
+        client_ip,
+        pid,
+        process_name,
+    )
+    return audit_id, client_name, client_ip
+
+
+def _finish_termination_audit(
+    audit_id: int | None,
+    client_name: str,
+    client_ip: str | None,
+    pid: int | None,
+    process_name: str | None,
+    result: str,
+    reason: str | None,
+) -> bool:
+    logger.info(
+        "Remote process termination client=%s client_ip=%s action=TERMINATE_PROCESS "
+        "pid=%s process=%s result=%s reason=%s",
+        client_name,
+        client_ip or "unknown",
+        pid if pid is not None else "invalid",
+        process_name or "unknown",
+        result,
+        reason or "-",
+    )
+    if audit_id is None:
+        return False
+    return db_manager.complete_process_termination_audit(
+        audit_id,
+        process_name,
+        result,
+        reason,
+    )
 
 
 def _queue_process_request(name: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -732,6 +965,7 @@ def handle_message(message: str, address: tuple[str, int]) -> str:
                 address[0],
                 PROCESS_LIST_CAPABILITY in parts[2:],
                 CONTROLLED_COMMANDS_CAPABILITY in parts[2:],
+                PROCESS_MANAGEMENT_CAPABILITY in parts[2:],
             )
             return "OK|REGISTERED"
         if len(parts) >= 2 and is_client_disconnected(parts[1]):
@@ -1141,7 +1375,7 @@ def api_controlled_commands(name: str):
     key = name.lower()
     if request.method == "POST":
         body = request.get_json(silent=True)
-        if not isinstance(body, dict) or set(body) != {"command"}:
+        if not isinstance(body, dict) or not isinstance(body.get("command"), str):
             logger.warning(
                 "Rejected malformed controlled-command API request for client %s.",
                 name,
@@ -1154,6 +1388,27 @@ def api_controlled_commands(name: str):
                 }
             ), 400
         command = body["command"]
+        expected_fields = (
+            {"command", "pid"}
+            if command == "TERMINATE_PROCESS"
+            else {"command"}
+        )
+        if set(body) != expected_fields:
+            logger.warning(
+                "Rejected malformed controlled-command API request for client %s.",
+                name,
+            )
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": (
+                        'TERMINATE_PROCESS requires exactly {"command": "...", "pid": integer}.'
+                        if command == "TERMINATE_PROCESS"
+                        else 'Request body must be {"command": "<allowed command>"}'
+                    ),
+                    "code": "MALFORMED_COMMAND",
+                }
+            ), 400
         if not isinstance(command, str) or command not in CONTROLLED_COMMANDS:
             logger.warning(
                 "Rejected unsupported controlled-command API request for client %s.",
@@ -1167,7 +1422,67 @@ def api_controlled_commands(name: str):
                 }
             ), 400
 
-        command_request, error = _queue_controlled_command(name, command)
+        pid = None
+        audit_id = None
+        audit_client_name = name[:100]
+        audit_client_ip = None
+        audit_process_name = None
+        if command == "TERMINATE_PROCESS":
+            raw_pid = body["pid"]
+            if (
+                type(raw_pid) is int
+                and 1 <= raw_pid <= MAX_REMOTE_PROCESS_PID
+            ):
+                pid = raw_pid
+                audit_process_name = _known_process_name(key, pid)
+            audit_id, audit_client_name, audit_client_ip = (
+                _start_termination_audit(
+                    name,
+                    pid,
+                    audit_process_name,
+                )
+            )
+            if audit_id is None:
+                logger.error(
+                    "Could not persist remote process termination audit request for client %s.",
+                    audit_client_name,
+                )
+                return jsonify(
+                    {
+                        "status": "error",
+                        "message": "Could not record the process termination audit request.",
+                        "code": "AUDIT_UNAVAILABLE",
+                    }
+                ), 503
+            if pid is None:
+                audit_saved = _finish_termination_audit(
+                    audit_id,
+                    audit_client_name,
+                    audit_client_ip,
+                    None,
+                    None,
+                    "REJECTED",
+                    "INVALID_PID",
+                )
+                if not audit_saved:
+                    logger.error(
+                        "Could not persist invalid process ID audit result for client %s.",
+                        audit_client_name,
+                    )
+                return jsonify(
+                    {
+                        "status": "error",
+                        "message": "PID must be a positive integer.",
+                        "code": "INVALID_PID",
+                    }
+                ), 400
+
+        command_request, error = _queue_controlled_command(
+            name,
+            command,
+            pid=pid,
+            audit_id=audit_id,
+        )
         if error is not None:
             with state_lock:
                 client = clients.get(key)
@@ -1177,6 +1492,11 @@ def api_controlled_commands(name: str):
                     error_code = "CLIENT_OFFLINE"
                 elif not client.get("controlled_commands_capable", False):
                     error_code = "COMMANDS_UNSUPPORTED"
+                elif (
+                    command in PROCESS_MANAGEMENT_COMMANDS
+                    and not client.get("process_management_capable", False)
+                ):
+                    error_code = "PROCESS_MANAGEMENT_UNSUPPORTED"
                 elif (
                     client.get("process_list_capable", False)
                     and not client.get("controlled_commands_capable", False)
@@ -1198,36 +1518,116 @@ def api_controlled_commands(name: str):
                 if error_code == "COMMAND_CAPACITY"
                 else 409
             )
+            if command == "TERMINATE_PROCESS":
+                audit_saved = _finish_termination_audit(
+                    audit_id,
+                    audit_client_name,
+                    audit_client_ip,
+                    pid,
+                    audit_process_name,
+                    "REJECTED",
+                    error_code,
+                )
+                if not audit_saved:
+                    logger.error(
+                        "Could not persist rejected process termination audit result for client %s.",
+                        audit_client_name,
+                    )
             logger.warning(
                 "Could not queue controlled command for client %s (%s).",
                 name,
                 error_code,
             )
-            return jsonify(
-                {
-                    "status": "error",
-                    "message": error,
-                    "code": error_code,
-                }
-            ), status_code
+            response = {
+                "status": "error",
+                "message": error,
+                "code": error_code,
+            }
+            if command == "GET_PROCESSES":
+                with state_lock:
+                    snapshot = process_snapshots.get(key)
+                    if snapshot is not None:
+                        response["process_snapshot"] = dict(snapshot)
+            return jsonify(response), status_code
         logger.info(
             "Queued controlled command %s for registered client %s.",
             command,
             name,
         )
+        if command == "TERMINATE_PROCESS":
+            logger.info(
+                "Remote process termination client=%s client_ip=%s action=TERMINATE_PROCESS "
+                "pid=%s process=%s result=QUEUED",
+                audit_client_name,
+                audit_client_ip or "unknown",
+                pid,
+                audit_process_name or "unknown",
+            )
         command_request.pop("expires_at", None)
-        return jsonify({"status": "ok", "request": command_request}), 202
+        command_request.pop("audit_id", None)
+        command_request.pop("client_ip", None)
+        response = {"status": "ok", "request": command_request}
+        if command == "GET_PROCESSES":
+            with state_lock:
+                snapshot = process_snapshots.get(key)
+                if snapshot is not None:
+                    response["process_snapshot"] = dict(snapshot)
+        return jsonify(response), 202
 
     with state_lock:
         _expire_controlled_command_locked(key)
         _prune_controlled_commands_locked(time.monotonic())
         command_request = controlled_command_requests.get(key)
         if command_request is None:
+            snapshot = process_snapshots.get(key)
+            if snapshot is not None:
+                return jsonify(
+                    {
+                        "status": "ok",
+                        "request": None,
+                        "process_snapshot": dict(snapshot),
+                    }
+                )
             return jsonify(
                 {"status": "error", "message": "No controlled command request found."}
             ), 404
         result = dict(command_request)
         result.pop("expires_at", None)
+        audit_id = result.pop("audit_id", None)
+        result.pop("client_ip", None)
+        snapshot = process_snapshots.get(key)
+        if snapshot is not None:
+            result["process_snapshot_updated_at"] = snapshot["updated_at"]
+            if not (
+                result.get("command") == "GET_PROCESSES"
+                and result.get("status") == "complete"
+            ):
+                result["process_snapshot"] = dict(snapshot)
+    if (
+        result.get("command") == "TERMINATE_PROCESS"
+        and result.get("status") == "timeout"
+        and isinstance(audit_id, int)
+        and result.get("audit_status") != "saved"
+    ):
+        audit_saved = _finish_termination_audit(
+            audit_id,
+            str(result.get("client") or name),
+            result.get("client_ip"),
+            result.get("pid"),
+            None,
+            "TIMEOUT",
+            "CLIENT_TIMEOUT_OR_DISCONNECTED",
+        )
+        with state_lock:
+            current = controlled_command_requests.get(key)
+            if current and current.get("request_id") == result.get("request_id"):
+                current["audit_status"] = "saved" if audit_saved else "error"
+                result["audit_status"] = current["audit_status"]
+        if not audit_saved:
+            logger.error(
+                "Could not persist timed-out process termination audit result for client %s.",
+                name,
+            )
     return jsonify({"status": "ok", "request": result})
 
 
@@ -1302,6 +1702,16 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
 .alert-time{font-size:11px;color:var(--subtext);margin-top:4px}
 .disconnect-button{background:#7f1d1d;color:#fee2e2;border:1px solid #b91c1c;padding:5px 9px;border-radius:6px;cursor:pointer}
 .disconnect-button:disabled{opacity:.45;cursor:not-allowed}
+.process-panel{margin-top:20px}
+.process-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.process-controls input,.process-controls select{background:#0f172a;color:#e2e8f0;border:1px solid var(--border);border-radius:6px;padding:7px}
+.process-controls button{background:#075985;color:#e0f2fe;border:1px solid #0369a1;border-radius:6px;padding:7px 10px;cursor:pointer}
+.process-controls button:last-child{background:#7f1d1d;color:#fee2e2;border-color:#b91c1c}
+.process-controls button:disabled{opacity:.45;cursor:not-allowed}
+.process-message{min-height:20px;color:var(--subtext);font-size:13px}
+.process-row{cursor:pointer}
+.process-row:hover{background:rgba(56,189,248,.05)}
+.process-row.selected{background:rgba(56,189,248,.14)}
 .empty{color:var(--subtext);text-align:center;padding:24px 0}
 @media(max-width:900px){.main-grid{grid-template-columns:1fr}.stats-grid{grid-template-columns:1fr}.chart-grid{grid-template-columns:1fr}}
 </style>
@@ -1377,6 +1787,58 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
       <div id="alerts"><div class="empty">Không có cảnh báo</div></div>
     </section>
   </div>
+
+  <section class="panel process-panel" aria-labelledby="process-heading">
+    <h2>
+      <span id="process-heading">Tiến trình máy khách đã chọn</span>
+      <span id="process-client-summary" style="font-size:12px;color:var(--subtext);font-weight:normal">
+        Chọn một máy khách đang trực tuyến
+      </span>
+    </h2>
+    <div class="process-controls">
+      <label for="process-search">Tìm theo tên</label>
+      <input id="process-search" type="search" autocomplete="off">
+      <label for="process-status-filter">Trạng thái</label>
+      <select id="process-status-filter">
+        <option value="">Tất cả</option>
+        <option value="running">running</option>
+        <option value="sleeping">sleeping</option>
+        <option value="stopped">stopped</option>
+        <option value="zombie">zombie</option>
+      </select>
+      <label for="process-sort">Sắp xếp</label>
+      <select id="process-sort">
+        <option value="memory_percent">RAM</option>
+        <option value="cpu_percent">CPU</option>
+        <option value="pid">PID</option>
+      </select>
+      <button id="refresh-processes" type="button" disabled>Làm mới tiến trình</button>
+      <button id="terminate-process" type="button" disabled>Kết thúc tiến trình...</button>
+    </div>
+    <p id="process-message" class="process-message" role="status">
+      Chọn một client để yêu cầu danh sách tiến trình.
+    </p>
+    <p id="process-last-update" class="process-message">
+      Cập nhật gần nhất: chưa có
+    </p>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>PID</th>
+            <th>Tiến trình</th>
+            <th>Người dùng</th>
+            <th>CPU %</th>
+            <th>RAM %</th>
+            <th>Trạng thái</th>
+          </tr>
+        </thead>
+        <tbody id="processes">
+          <tr><td colspan="6" class="empty">Chưa tải tiến trình</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
 </div>
 
 <script>
@@ -1386,6 +1848,13 @@ const chartSettings = {
   network: { color: '#a78bfa', valueEl: 'network-value', canvasId: 'network-chart' }
 };
 let selectedClientName = null;
+let selectedProcessPid = null;
+let clientSnapshots = [];
+let processSnapshots = [];
+let adminToken = null;
+let processRequestGeneration = 0;
+let processCommandInFlight = false;
+let processLastUpdatedAt = null;
 const adminDisconnectEnabled = {{ 'true' if admin_disconnect_enabled else 'false' }};
 const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -1579,7 +2048,32 @@ async function refresh() {
     const clientsData = (await clientsRes.json()).clients || [];
     const alertsData = (await alertsRes.json()).alerts || [];
 
+    const previouslySelectedClient = selectedClientName;
     updateSelection(clientsData);
+    clientSnapshots = clientsData;
+    if (previouslySelectedClient !== selectedClientName) {
+      processRequestGeneration += 1;
+      processSnapshots = [];
+      processLastUpdatedAt = null;
+      selectedProcessPid = null;
+      document.getElementById('process-last-update').textContent =
+        'Cập nhật gần nhất: chưa có';
+      document.getElementById('process-message').textContent =
+        selectedClientName
+          ? `Đã chọn ${selectedClientName}; tải tiến trình khi cần.`
+          : 'Chọn một client để yêu cầu danh sách tiến trình.';
+    }
+    const processClient = selectedClient();
+    if (!processClient || processClient.status !== 'ONLINE') {
+      document.getElementById('process-message').textContent = processClient
+        ? processLastUpdatedAt == null
+          ? `Client ${processClient.name} đang ngoại tuyến; dữ liệu tiến trình hiện không khả dụng.`
+          : `Client ${processClient.name} đang ngoại tuyến; đang hiển thị dữ liệu gần nhất.`
+        : 'Chọn một client để yêu cầu danh sách tiến trình.';
+      renderProcessRows();
+    } else {
+      renderProcessClient();
+    }
 
     const onlineCount = clientsData.filter(c => c.status === 'ONLINE').length;
     document.getElementById('stat-total').textContent = clientsData.length;
@@ -1638,26 +2132,336 @@ async function refresh() {
 
 function selectClient(clientName) {
   selectedClientName = clientName;
+  processRequestGeneration += 1;
+  processSnapshots = [];
+  processLastUpdatedAt = null;
+  document.getElementById('process-last-update').textContent =
+    'Cập nhật gần nhất: chưa có';
+  selectedProcessPid = null;
+  document.getElementById('process-message').textContent =
+    `Đã chọn ${clientName}; đang tải tiến trình...`;
+  renderProcessRows();
   refresh();
+  refreshProcesses();
+}
+
+function requestAdminToken() {
+  if (adminToken) return adminToken;
+  const token = window.prompt('Nhập MONITOR_ADMIN_TOKEN:');
+  if (token === null || token === '') return null;
+  adminToken = token;
+  return adminToken;
+}
+
+async function adminFetch(url, options = {}) {
+  const token = requestAdminToken();
+  if (!token) throw new Error('Cần MONITOR_ADMIN_TOKEN để thực hiện thao tác quản trị.');
+  const response = await fetch(url, {
+    ...options,
+    headers: { ...(options.headers || {}), 'X-Admin-Token': token }
+  });
+  let result = {};
+  try {
+    result = await response.json();
+  } catch (_error) {
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  }
+  if (!response.ok) {
+    if (response.status === 401) adminToken = null;
+    const error = new Error(result.message || `HTTP ${response.status}`);
+    error.payload = result;
+    throw error;
+  }
+  return result;
+}
+
+async function pollControlledCommand(clientName, requestId) {
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 400));
+    const data = await adminFetch(
+      `/api/clients/${encodeURIComponent(clientName)}/commands`
+    );
+    const request = data.request;
+    if (!request || request.request_id !== requestId) {
+      throw new Error('Trạng thái lệnh không khớp yêu cầu đang chờ.');
+    }
+    if (['complete', 'error', 'timeout'].includes(request.status)) {
+      if (data.process_snapshot_updated_at != null) {
+        request.process_snapshot_updated_at = data.process_snapshot_updated_at;
+      }
+      if (data.process_snapshot) request.process_snapshot = data.process_snapshot;
+      return request;
+    }
+  }
+  throw new Error('Hết thời gian chờ phản hồi từ máy khách.');
+}
+
+function selectedClient() {
+  return clientSnapshots.find(client => client.name === selectedClientName) || null;
+}
+
+function renderProcessClient() {
+  const client = selectedClient();
+  const summary = document.getElementById('process-client-summary');
+  const refreshButton = document.getElementById('refresh-processes');
+  const terminateButton = document.getElementById('terminate-process');
+  if (!client) {
+    summary.textContent = 'Chọn một máy khách đang trực tuyến';
+    refreshButton.disabled = true;
+    terminateButton.disabled = true;
+    return;
+  }
+  summary.textContent =
+    `Client: ${client.name} · IP: ${client.ip} · ${client.status} · ` +
+    `CPU ${client.cpu}% · RAM ${client.ram}% · Disk ${client.disk}%`;
+  refreshButton.disabled = client.status !== 'ONLINE' || !adminDisconnectEnabled;
+  terminateButton.disabled =
+    client.status !== 'ONLINE' || !adminDisconnectEnabled || selectedProcessPid == null;
+}
+
+function renderProcessRows() {
+  const tbody = document.getElementById('processes');
+  const query = document.getElementById('process-search').value.trim().toLowerCase();
+  const statusFilter = document.getElementById('process-status-filter').value;
+  const sortBy = document.getElementById('process-sort').value;
+  const rows = processSnapshots
+    .filter(process =>
+      String(process.name || '').toLowerCase().includes(query) &&
+      (!statusFilter || process.status === statusFilter)
+    )
+    .sort((left, right) => {
+      const leftValue = Number(left[sortBy]) || 0;
+      const rightValue = Number(right[sortBy]) || 0;
+      return sortBy === 'pid' ? leftValue - rightValue : rightValue - leftValue;
+    });
+  if (!rows.some(process => process.pid === selectedProcessPid)) {
+    selectedProcessPid = null;
+  }
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">Không có tiến trình khớp bộ lọc</td></tr>';
+    selectedProcessPid = null;
+    renderProcessClient();
+    return;
+  }
+  tbody.innerHTML = rows.map(process => `
+    <tr class="process-row ${selectedProcessPid === process.pid ? 'selected' : ''}"
+        data-process-pid="${Number(process.pid)}">
+      <td>${Number(process.pid)}</td>
+      <td>${escapeHtml(process.name)}</td>
+      <td>${escapeHtml(process.username || '—')}</td>
+      <td>${process.cpu_percent == null ? '—' : `${Number(process.cpu_percent).toFixed(2)}%`}</td>
+      <td>${process.memory_percent == null ? '—' : `${Number(process.memory_percent).toFixed(2)}%`}</td>
+      <td>${escapeHtml(process.status || '—')}</td>
+    </tr>
+  `).join('');
+  tbody.querySelectorAll('tr[data-process-pid]').forEach(row => {
+    row.addEventListener('click', () => {
+      selectedProcessPid = Number(row.dataset.processPid);
+      renderProcessRows();
+    });
+  });
+  renderProcessClient();
+}
+
+function applyProcessSnapshot(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.processes)) return false;
+  processSnapshots = snapshot.processes;
+  if (
+    snapshot.updated_at != null &&
+    Number.isFinite(Number(snapshot.updated_at))
+  ) {
+    processLastUpdatedAt = Number(snapshot.updated_at);
+    document.getElementById('process-last-update').textContent =
+      `Cập nhật gần nhất: ${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}`;
+  }
+  renderProcessRows();
+  return true;
+}
+
+async function refreshProcesses() {
+  const client = selectedClient();
+  const message = document.getElementById('process-message');
+  if (!client) {
+    renderProcessClient();
+    return;
+  }
+  if (!adminDisconnectEnabled) {
+    message.textContent = 'Máy chủ chưa cấu hình MONITOR_ADMIN_TOKEN.';
+    return;
+  }
+  if (client.status !== 'ONLINE') {
+    message.textContent = `Client ${client.name} đang ngoại tuyến.`;
+    return;
+  }
+  if (processCommandInFlight) return;
+  const generation = ++processRequestGeneration;
+  processCommandInFlight = true;
+  message.textContent = `Đang yêu cầu tiến trình từ ${client.name}...`;
+  try {
+    const queued = await adminFetch(
+      `/api/clients/${encodeURIComponent(client.name)}/commands`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: 'GET_PROCESSES' })
+      }
+    );
+    if (
+      generation !== processRequestGeneration ||
+      selectedClientName !== client.name
+    ) return;
+    applyProcessSnapshot(queued.process_snapshot);
+    const requestId = queued.request && queued.request.request_id;
+    if (typeof requestId !== 'string') throw new Error('Máy chủ không trả về mã yêu cầu hợp lệ.');
+    const request = await pollControlledCommand(client.name, requestId);
+    if (
+      generation !== processRequestGeneration ||
+      selectedClientName !== client.name
+    ) return;
+    if (request.status !== 'complete' || !Array.isArray(request.result)) {
+      applyProcessSnapshot(request.process_snapshot);
+      throw new Error(request.error_code || 'Máy khách không thể trả danh sách tiến trình.');
+    }
+    processSnapshots = request.result;
+    if (
+      request.process_snapshot_updated_at != null &&
+      Number.isFinite(Number(request.process_snapshot_updated_at))
+    ) {
+      processLastUpdatedAt = Number(request.process_snapshot_updated_at);
+      document.getElementById('process-last-update').textContent =
+        `Cập nhật gần nhất: ${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}`;
+    }
+    renderProcessRows();
+    message.textContent = `Đã nhận ${processSnapshots.length} tiến trình từ ${client.name}.`;
+  } catch (error) {
+    if (
+      generation === processRequestGeneration &&
+      selectedClientName === client.name
+    ) {
+      applyProcessSnapshot(error.payload && error.payload.process_snapshot);
+      message.textContent = processLastUpdatedAt == null
+        ? `Không thể tải tiến trình: ${error.message}`
+        : `Không thể cập nhật tiến trình; đang hiển thị dữ liệu gần nhất (${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}): ${error.message}`;
+    }
+  } finally {
+    processCommandInFlight = false;
+  }
+}
+
+async function terminateSelectedProcess() {
+  const client = selectedClient();
+  const process = processSnapshots.find(item => item.pid === selectedProcessPid);
+  if (!client || !process) return;
+  if (!window.confirm(
+    `Kết thúc tiến trình?\n\nTiến trình: ${process.name}\nPID: ${process.pid}`
+  )) return;
+  if (processCommandInFlight) return;
+  processCommandInFlight = true;
+  const generation = ++processRequestGeneration;
+  const clientName = client.name;
+  const message = document.getElementById('process-message');
+  message.textContent = `Đang yêu cầu kết thúc ${process.name} trên ${client.name}...`;
+  try {
+    const queued = await adminFetch(
+      `/api/clients/${encodeURIComponent(clientName)}/commands`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          command: 'TERMINATE_PROCESS',
+          pid: Number(process.pid)
+        })
+      }
+    );
+    const requestId = queued.request && queued.request.request_id;
+    if (typeof requestId !== 'string') throw new Error('Máy chủ không trả về mã yêu cầu hợp lệ.');
+    const request = await pollControlledCommand(clientName, requestId);
+    const result = request.result;
+    if (request.status !== 'complete' || !result || result.status !== 'ok') {
+      throw new Error(
+        (result && result.message) ||
+        request.error_code ||
+        'Máy khách từ chối kết thúc tiến trình.'
+      );
+    }
+    window.alert(`Đã kết thúc ${result.name} (PID ${result.pid}) trên ${clientName}.`);
+    if (
+      generation !== processRequestGeneration ||
+      selectedClientName !== clientName
+    ) return;
+    message.textContent = 'Đang làm mới để xác nhận tiến trình đã dừng...';
+    const refreshRequest = await queueAndPollProcessList(clientName);
+    if (
+      generation !== processRequestGeneration ||
+      selectedClientName !== clientName
+    ) return;
+    if (refreshRequest.status !== 'complete' || !Array.isArray(refreshRequest.result)) {
+      throw new Error('Đã kết thúc tiến trình nhưng không thể xác minh danh sách mới.');
+    }
+    processSnapshots = refreshRequest.result;
+    if (
+      refreshRequest.process_snapshot_updated_at != null &&
+      Number.isFinite(Number(refreshRequest.process_snapshot_updated_at))
+    ) {
+      processLastUpdatedAt = Number(refreshRequest.process_snapshot_updated_at);
+      document.getElementById('process-last-update').textContent =
+        `Cập nhật gần nhất: ${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}`;
+    }
+    selectedProcessPid = null;
+    renderProcessRows();
+    const stillRunning = processSnapshots.some(item => item.pid === result.pid);
+    message.textContent = stillRunning
+      ? `${result.name} (PID ${result.pid}) vẫn xuất hiện trong danh sách mới.`
+      : `Đã xác nhận ${result.name} (PID ${result.pid}) không còn chạy.`;
+  } catch (error) {
+    if (
+      generation === processRequestGeneration &&
+      selectedClientName === clientName
+    ) {
+      message.textContent = `Không thể kết thúc tiến trình: ${error.message}`;
+    }
+  } finally {
+    processCommandInFlight = false;
+  }
+}
+
+async function queueAndPollProcessList(clientName) {
+  const queued = await adminFetch(
+    `/api/clients/${encodeURIComponent(clientName)}/commands`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'GET_PROCESSES' })
+    }
+  );
+  const requestId = queued.request && queued.request.request_id;
+  if (typeof requestId !== 'string') throw new Error('Máy chủ không trả về mã yêu cầu hợp lệ.');
+  return pollControlledCommand(clientName, requestId);
 }
 
 async function disconnectClient(clientName) {
   if (!window.confirm(`Ngắt kết nối client "${clientName}"?`)) return;
-  const token = window.prompt('Nhập MONITOR_ADMIN_TOKEN:');
-  if (token === null) return;
   try {
-    const response = await fetch(`/api/clients/${encodeURIComponent(clientName)}/disconnect`, {
-      method: 'POST',
-      headers: { 'X-Admin-Token': token }
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.message || `HTTP ${response.status}`);
+    const result = await adminFetch(
+      `/api/clients/${encodeURIComponent(clientName)}/disconnect`,
+      { method: 'POST' }
+    );
     window.alert(result.message);
     refresh();
   } catch (error) {
     window.alert(`Không thể ngắt kết nối client: ${error.message}`);
   }
 }
+
+document.getElementById('process-search').addEventListener('input', renderProcessRows);
+document.getElementById('process-status-filter').addEventListener('change', renderProcessRows);
+document.getElementById('process-sort').addEventListener('change', renderProcessRows);
+document.getElementById('refresh-processes').addEventListener('click', refreshProcesses);
+document.getElementById('terminate-process').addEventListener('click', terminateSelectedProcess);
+setInterval(() => {
+  if (selectedClientName && adminToken) refreshProcesses();
+}, 10000);
 
 refresh();
 setInterval(refresh, 2500);
@@ -1692,8 +2496,10 @@ def start_services() -> None:
         raise SystemExit("Could not initialize client statuses in MySQL; server will not start.")
     if not ADMIN_TOKEN:
         logger.warning(
-            "MONITOR_ADMIN_TOKEN is not configured; dashboard disconnect is disabled."
+            "MONITOR_ADMIN_TOKEN is not configured. Administrative operations are disabled."
         )
+    else:
+        logger.info("Admin authentication configured.")
 
     threading.Thread(target=mark_offline_clients, daemon=True).start()
     threading.Thread(target=tcp_server, daemon=True).start()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import platform
 from typing import Any
 
 try:
@@ -10,10 +12,25 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
-TOP_N = 20
+TOP_N = 50
 PROCESS_FIELDS = frozenset(
     {"pid", "name", "username", "cpu_percent", "memory_percent", "status"}
 )
+PROTECTED_PROCESSES = {
+    "windows": frozenset(
+        {
+            "csrss.exe",
+            "lsass.exe",
+            "services.exe",
+            "smss.exe",
+            "system",
+            "wininit.exe",
+            "winlogon.exe",
+        }
+    ),
+    "linux": frozenset({"init", "kthreadd", "systemd"}),
+    "darwin": frozenset({"kernel_task", "launchd"}),
+}
 
 
 def collect_process_list(limit: int = TOP_N) -> list[dict[str, Any]]:
@@ -92,3 +109,85 @@ def _bounded_percentage(value: Any) -> float | None:
     if not 0.0 <= percentage <= 100.0:
         return None
     return round(percentage, 2)
+
+
+def terminate_process(pid: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": "error",
+        "code": "FAILED",
+        "pid": pid if type(pid) is int and pid > 0 else None,
+        "name": None,
+        "message": "Could not terminate process.",
+    }
+    if type(pid) is not int or pid <= 0 or pid > 4_294_967_295:
+        result.update(code="INVALID_PID", message="PID must be a positive integer.")
+        return result
+    if pid <= 1 or pid == os.getpid():
+        result.update(
+            code="PROTECTED_PROCESS",
+            message="This process is protected by the client safety policy.",
+        )
+        return result
+    if psutil is None:
+        result.update(
+            code="UNAVAILABLE",
+            message="Process management is unavailable because psutil is missing.",
+        )
+        return result
+
+    try:
+        process = psutil.Process(pid)
+        process_name = process.name()
+        result["name"] = process_name[:256] if isinstance(process_name, str) else None
+        platform_name = platform.system().lower()
+        protected_names = PROTECTED_PROCESSES.get(platform_name, frozenset())
+        if result["name"] and result["name"].casefold() in protected_names:
+            result.update(
+                code="PROTECTED_PROCESS",
+                message="This process is protected by the client safety policy.",
+            )
+            return result
+        if not process.is_running():
+            result.update(
+                code="PROCESS_NOT_FOUND",
+                message="The process is no longer running.",
+            )
+            return result
+        process.terminate()
+        process.wait(timeout=5)
+    except psutil.ZombieProcess:
+        result.update(code="PROCESS_NOT_FOUND", message="The process is no longer running.")
+        return result
+    except psutil.NoSuchProcess:
+        result.update(code="PROCESS_NOT_FOUND", message="The process no longer exists.")
+        return result
+    except psutil.AccessDenied:
+        result.update(
+            code="ACCESS_DENIED",
+            message="The client does not have permission to terminate this process.",
+        )
+        return result
+    except psutil.TimeoutExpired:
+        result.update(
+            code="TERMINATION_TIMEOUT",
+            message="The process did not exit before the termination timeout.",
+        )
+        return result
+    except OSError as error:
+        logger.warning(
+            "Process termination failed for PID %s (%s).",
+            pid,
+            type(error).__name__,
+        )
+        result.update(
+            code="FAILED",
+            message="The operating system could not terminate this process.",
+        )
+        return result
+
+    result.update(
+        status="ok",
+        code="PROCESS_TERMINATED",
+        message="Process terminated successfully.",
+    )
+    return result

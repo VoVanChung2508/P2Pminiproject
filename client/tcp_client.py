@@ -5,6 +5,7 @@ import platform
 import socket
 import sys
 import time
+from collections import deque
 from typing import Any, Dict, Optional
 
 try:
@@ -17,19 +18,25 @@ if __package__ in (None, ""):
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-from client.process_monitor import TOP_N, collect_process_list
+from client.process_monitor import TOP_N, collect_process_list, terminate_process
+from common.command_auth import verify_process_command
 
 
 logger = logging.getLogger(__name__)
 PROCESS_LIST_CAPABILITY = "PROCESS_LIST_V1"
 CONTROLLED_COMMANDS_CAPABILITY = "CONTROLLED_COMMANDS_V1"
+PROCESS_MANAGEMENT_CAPABILITY = "PROCESS_MANAGEMENT_V1"
 PROCESS_LIST_SOCKET_TIMEOUT_SECONDS = 10
+PROCESSED_REQUEST_RETENTION_SECONDS = 300
+MAX_PROCESSED_REQUEST_IDS = 2048
 MAX_SERVER_FRAME_BYTES = 65536 + 512
 CONTROLLED_COMMANDS = {
     "PING",
     "GET_INFO",
     "GET_PROCESS_LIST",
     "GET_NETWORK_INFO",
+    "GET_PROCESSES",
+    "TERMINATE_PROCESS",
 }
 
 
@@ -40,6 +47,8 @@ class TCPClient:
         self.default_name = default_name
         self._last_network_counters: tuple[int, int, int, int] | None = None
         self._last_network_sample_time: float | None = None
+        self._processed_process_request_ids: deque[tuple[str, float]] = deque()
+        self._processed_process_request_id_set: set[str] = set()
 
     def _build_message(self, action: str, payload: Optional[Dict[str, Any]] = None) -> str:
         payload = payload or {}
@@ -49,7 +58,7 @@ class TCPClient:
             port = payload.get("port") or self.port
             return (
                 f"REGISTER|{name}|{host}|{port}|{PROCESS_LIST_CAPABILITY}"
-                f"|{CONTROLLED_COMMANDS_CAPABILITY}"
+                f"|{CONTROLLED_COMMANDS_CAPABILITY}|{PROCESS_MANAGEMENT_CAPABILITY}"
             )
         if action == "HEARTBEAT":
             name = str(payload.get("name") or self.default_name).strip()
@@ -186,12 +195,14 @@ class TCPClient:
                 client_name,
             )
         if (
-            len(parts) not in {3, 4}
+            len(parts) not in {3, 4, 5}
             or not parts[1].isalnum()
             or len(parts[1]) > 64
             or parts[2] not in CONTROLLED_COMMANDS
             or (parts[2] == "GET_PROCESS_LIST" and len(parts) != 4)
-            or (parts[2] != "GET_PROCESS_LIST" and len(parts) != 3)
+            or (parts[2] in {"PING", "GET_INFO", "GET_NETWORK_INFO"} and len(parts) != 3)
+            or (parts[2] == "GET_PROCESSES" and len(parts) != 4)
+            or (parts[2] == "TERMINATE_PROCESS" and len(parts) != 5)
         ):
             logger.warning("Rejecting malformed or unsupported server command.")
             return {
@@ -202,6 +213,52 @@ class TCPClient:
 
         request_id = parts[1]
         command_name = parts[2]
+        signed_argument = ""
+        signature = ""
+        if command_name == "GET_PROCESSES":
+            if len(parts) != 4:
+                return self._unsupported_server_command(command)
+            signature = parts[3]
+        elif command_name == "TERMINATE_PROCESS":
+            if len(parts) != 5:
+                return self._unsupported_server_command(command)
+            signed_argument = parts[3]
+            signature = parts[4]
+            if (
+                not signed_argument.isascii()
+                or not signed_argument.isdecimal()
+                or not 1 <= int(signed_argument) <= 4_294_967_295
+            ):
+                return self._unsupported_server_command(command)
+        elif command_name == "GET_PROCESS_LIST" and len(parts) == 4:
+            pass
+        elif len(parts) != 3:
+            return self._unsupported_server_command(command)
+
+        if command_name in {"GET_PROCESSES", "TERMINATE_PROCESS"}:
+            token = os.environ.get("MONITOR_ADMIN_TOKEN", "")
+            if not verify_process_command(
+                token,
+                request_id,
+                client_name,
+                command_name,
+                signed_argument,
+                signature,
+            ):
+                return self._send_command_error(
+                    sock,
+                    command,
+                    request_id,
+                    "UNAUTHORIZED",
+                )
+            if self._has_processed_request_id(request_id):
+                return self._send_command_error(
+                    sock,
+                    command,
+                    request_id,
+                    "REPLAYED",
+                )
+
         logger.info("Executing allowlisted server command %s.", command_name)
         try:
             if command_name == "PING":
@@ -223,6 +280,15 @@ class TCPClient:
                     raise ValueError("Process-list limit is invalid.")
                 process_list = collect_process_list(int(parts[3]))
                 response_payload = json.dumps(process_list, separators=(",", ":"))
+            elif command_name == "GET_PROCESSES":
+                process_list = collect_process_list(TOP_N)
+                response_payload = json.dumps(process_list, separators=(",", ":"))
+            elif command_name == "TERMINATE_PROCESS":
+                termination_result = terminate_process(int(signed_argument))
+                response_payload = json.dumps(
+                    termination_result,
+                    separators=(",", ":"),
+                )
             elif command_name == "GET_NETWORK_INFO":
                 response_payload = json.dumps(
                     self._collect_network_info(),
@@ -239,6 +305,8 @@ class TCPClient:
             )
             response = f"COMMAND_ERROR|{request_id}|UNAVAILABLE"
 
+        if command_name in {"GET_PROCESSES", "TERMINATE_PROCESS"}:
+            self._remember_processed_request_id(request_id)
         sock.sendall((response + "\n").encode("utf-8"))
         acknowledgement = self._read_line(sock)
         if acknowledgement is None:
@@ -266,6 +334,63 @@ class TCPClient:
                 "complete" if command_succeeded else "error"
             ),
         }
+
+    @staticmethod
+    def _unsupported_server_command(command: str) -> Dict[str, Any]:
+        logger.warning("Rejecting malformed or unsupported server command.")
+        return {
+            "status": "error",
+            "raw": command,
+            "message": "Unsupported server command",
+        }
+
+    def _send_command_error(
+        self,
+        sock: socket.socket,
+        command: str,
+        request_id: str,
+        error_code: str,
+    ) -> Dict[str, Any]:
+        response = f"COMMAND_ERROR|{request_id}|{error_code}"
+        sock.sendall((response + "\n").encode("utf-8"))
+        acknowledgement = self._read_line(sock)
+        if acknowledgement is None:
+            return {
+                "status": "error",
+                "raw": command,
+                "message": "No acknowledgement for rejected controlled command",
+                "command_status": "error",
+            }
+        ack_result = self._response_result(acknowledgement)
+        return {
+            "status": "error",
+            "raw": acknowledgement,
+            "message": ack_result["message"],
+            "command_status": "error",
+        }
+
+    def _has_processed_request_id(self, request_id: str) -> bool:
+        self._prune_processed_request_ids()
+        return request_id in self._processed_process_request_id_set
+
+    def _remember_processed_request_id(self, request_id: str) -> None:
+        self._prune_processed_request_ids()
+        if request_id in self._processed_process_request_id_set:
+            return
+        self._processed_process_request_id_set.add(request_id)
+        self._processed_process_request_ids.append((request_id, time.monotonic()))
+        while len(self._processed_process_request_ids) > MAX_PROCESSED_REQUEST_IDS:
+            expired_id, _ = self._processed_process_request_ids.popleft()
+            self._processed_process_request_id_set.discard(expired_id)
+
+    def _prune_processed_request_ids(self) -> None:
+        cutoff = time.monotonic() - PROCESSED_REQUEST_RETENTION_SECONDS
+        while (
+            self._processed_process_request_ids
+            and self._processed_process_request_ids[0][1] < cutoff
+        ):
+            expired_id, _ = self._processed_process_request_ids.popleft()
+            self._processed_process_request_id_set.discard(expired_id)
 
     def _answer_legacy_process_list_command(
         self,
