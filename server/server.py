@@ -1884,6 +1884,7 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
 .process-controls button:last-child{background:#7f1d1d;color:#fee2e2;border-color:#b91c1c}
 .process-controls button:disabled{opacity:.45;cursor:not-allowed}
 .process-message{min-height:20px;color:var(--subtext);font-size:13px}
+.process-error{color:#fecaca;background:rgba(127,29,29,.45);border-left:3px solid var(--danger);padding:10px 12px;border-radius:0 6px 6px 0}
 .process-row{cursor:pointer}
 .process-row:hover{background:rgba(56,189,248,.05)}
 .process-row.selected{background:rgba(56,189,248,.14)}
@@ -1993,6 +1994,7 @@ th{color:var(--subtext);font-size:11px;text-transform:uppercase;letter-spacing:0
     <p id="process-message" class="process-message" role="status">
       Chọn một client để yêu cầu danh sách tiến trình.
     </p>
+    <p id="process-error" class="process-message process-error" role="alert" aria-live="assertive" hidden></p>
     <p id="process-last-update" class="process-message">
       Cập nhật gần nhất: chưa có
     </p>
@@ -2372,10 +2374,48 @@ async function adminFetch(url, options = {}) {
   if (!response.ok) {
     if (response.status === 401) adminToken = null;
     const error = new Error(result.message || `HTTP ${response.status}`);
+    error.status = response.status;
     error.payload = result;
     throw error;
   }
   return result;
+}
+
+function formatProcessTrackingError(error) {
+  if (error && error.status === 401) {
+    return 'MONITOR_ADMIN_TOKEN không hợp lệ. Hãy nhập lại đúng token đang cấu hình trên server.';
+  }
+  if (
+    error &&
+    error.status === 503 &&
+    error.message === 'Server admin token is not configured'
+  ) {
+    return 'Server chưa cấu hình MONITOR_ADMIN_TOKEN. Hãy cấu hình trên server rồi khởi động lại.';
+  }
+  if (error && error.message === 'UNAUTHORIZED') {
+    return 'Máy khách từ chối chữ ký lệnh. Hãy kiểm tra MONITOR_ADMIN_TOKEN trên server và client giống nhau.';
+  }
+  if (
+    error &&
+    ['COMMAND_TIMEOUT', 'Hết thời gian chờ phản hồi từ máy khách.'].includes(error.message)
+  ) {
+    return 'Máy khách chưa phản hồi. Hãy kiểm tra máy khách còn trực tuyến, có gửi heartbeat và hỗ trợ theo dõi tiến trình.';
+  }
+  return error && error.message
+    ? String(error.message)
+    : 'Đã xảy ra lỗi không xác định khi theo dõi tiến trình.';
+}
+
+function showProcessError(error) {
+  const alert = document.getElementById('process-error');
+  alert.textContent = formatProcessTrackingError(error);
+  alert.hidden = false;
+}
+
+function clearProcessError() {
+  const alert = document.getElementById('process-error');
+  alert.textContent = '';
+  alert.hidden = true;
 }
 
 async function pollControlledCommand(clientName, requestId) {
@@ -2522,9 +2562,11 @@ async function refreshProcessActivity(clientName, generation) {
       generation === processRequestGeneration &&
       selectedClientName === clientName
     ) {
-      document.getElementById('process-message').textContent =
-        'Không thể tải lịch sử hoạt động tiến trình.';
-      tbody.innerHTML = '<tr><td colspan="4" class="empty">Không thể tải hoạt động tiến trình</td></tr>';
+      const errorMessage = formatProcessTrackingError(error);
+      document.getElementById('process-monitoring-status').textContent =
+        'Process Monitoring: UNAVAILABLE';
+      showProcessError(error);
+      tbody.innerHTML = `<tr><td colspan="4" class="empty">${escapeHtml(errorMessage)}</td></tr>`;
     }
   }
 }
@@ -2545,6 +2587,7 @@ async function refreshProcesses() {
     return;
   }
   if (processCommandInFlight) return;
+  clearProcessError();
   const generation = ++processRequestGeneration;
   processCommandInFlight = true;
   message.textContent = `Đang yêu cầu tiến trình từ ${client.name}...`;
@@ -2571,7 +2614,11 @@ async function refreshProcesses() {
     ) return;
     if (request.status !== 'complete' || !Array.isArray(request.result)) {
       applyProcessSnapshot(request.process_snapshot);
-      throw new Error(request.error_code || 'Máy khách không thể trả danh sách tiến trình.');
+      throw new Error(
+        request.status === 'timeout'
+          ? 'COMMAND_TIMEOUT'
+          : request.error_code || 'Máy khách không thể trả danh sách tiến trình.'
+      );
     }
     if (!applyProcessSnapshot(request.process_snapshot)) {
       processSnapshots = request.result;
@@ -2585,10 +2632,11 @@ async function refreshProcesses() {
       selectedClientName === client.name
     ) {
       applyProcessSnapshot(error.payload && error.payload.process_snapshot);
-      await refreshProcessActivity(client.name, generation);
+      showProcessError(error);
+      const errorMessage = formatProcessTrackingError(error);
       message.textContent = processLastUpdatedAt == null
-        ? `Không thể tải tiến trình: ${error.message}`
-        : `Không thể cập nhật tiến trình; đang hiển thị dữ liệu gần nhất (${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}): ${error.message}`;
+        ? `Không thể tải tiến trình: ${errorMessage}`
+        : `Không thể cập nhật tiến trình; đang hiển thị dữ liệu gần nhất (${new Date(processLastUpdatedAt * 1000).toLocaleTimeString()}): ${errorMessage}`;
     }
   } finally {
     processCommandInFlight = false;

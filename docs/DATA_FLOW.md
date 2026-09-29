@@ -315,6 +315,17 @@ công vào MySQL.
    Giao diện hiển thị lỗi và tải lại danh sách sau khi kết thúc thành công để
    xác minh PID đã biến mất.
 
+Dashboard hiển thị lỗi xác thực và lỗi theo dõi tiến trình trong vùng thông
+báo của bảng tiến trình. HTTP 401 nghĩa là `X-Admin-Token` gửi tới API không
+khớp `MONITOR_ADMIN_TOKEN` đang chạy trên server; yêu cầu bị từ chối trước khi
+được xếp hàng và chưa được gửi tới client. Khi gặp lỗi này dashboard xóa token
+đang giữ trong bộ nhớ để người quản trị có thể nhập lại, đồng thời không gửi
+thêm request quản trị trong cùng lần xử lý lỗi. Nếu API chấp nhận yêu cầu
+nhưng client trả `UNAUTHORIZED`, hãy kiểm tra `MONITOR_ADMIN_TOKEN` của client
+và server có cùng giá trị, vì client cần khóa đó để xác minh chữ ký HMAC.
+Sau khi thay đổi biến môi trường, khởi động lại tiến trình tương ứng. Không
+ghi token vào log hoặc chia sẻ giá trị token khi xử lý lỗi.
+
 Dashboard yêu cầu snapshot theo chu kỳ 10 giây, so sánh snapshot thành công
 gần nhất của đúng máy khách theo PID và tên tiến trình, rồi hiển thị danh sách
 hiện tại cùng sự kiện STARTED/STOPPED mới nhất. Snapshot thành công đầu tiên

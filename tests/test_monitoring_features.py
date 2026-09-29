@@ -344,6 +344,33 @@ class ServerDisconnectTests(unittest.TestCase):
         self.assertIn(b"disconnectClient", response.data)
         self.assertIn(b"const adminDisconnectEnabled = true", response.data)
 
+    def test_dashboard_explains_process_tracking_authentication_errors(self) -> None:
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            b'id="process-error" class="process-message process-error" role="alert"',
+            response.data,
+        )
+        self.assertIn(
+            "MONITOR_ADMIN_TOKEN không hợp lệ. Hãy nhập lại đúng token "
+            "đang cấu hình trên server.".encode("utf-8"),
+            response.data,
+        )
+        self.assertIn(
+            "kiểm tra MONITOR_ADMIN_TOKEN trên server và client giống nhau".encode(
+                "utf-8"
+            ),
+            response.data,
+        )
+        self.assertIn(
+            "Máy khách chưa phản hồi. Hãy kiểm tra máy khách còn trực tuyến, "
+            "có gửi heartbeat và hỗ trợ theo dõi tiến trình.".encode("utf-8"),
+            response.data,
+        )
+        self.assertIn(b"function formatProcessTrackingError(error)", response.data)
+        self.assertIn(b"showProcessError(error)", response.data)
+
     def test_dashboard_renders_last_seen_column_and_missing_value_fallback(self) -> None:
         response = self.client.get("/")
 
